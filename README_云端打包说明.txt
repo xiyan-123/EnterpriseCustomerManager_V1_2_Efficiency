@@ -1,7 +1,7 @@
 GitHub Actions 云端打包说明
 
-1. 解压 EnterpriseCustomerManager_V1_3_1.zip。
-2. 上传 EnterpriseCustomerManager_V1_3_1 文件夹内的全部内容到 GitHub 仓库根目录：
+1. 解压 EnterpriseCustomerManager_V1_3_2.zip。
+2. 上传 EnterpriseCustomerManager_V1_3_2 文件夹内的全部内容到 GitHub 仓库根目录：
    app
    .github
    build.gradle
@@ -17,8 +17,3 @@ GitHub Actions 云端打包说明
 9. 手机安装时请选择覆盖安装，不要先卸载旧版。
 
 如果 GitHub 没有出现 Build Android APK，说明 .github/workflows/build-apk.yml 没有上传成功，需要手动补该文件。
-
-注意：
-- 本版本包名保持 com.example.enterprisecustomer。
-- 覆盖安装不会清空旧数据。
-- 首次安装新版本后，建议先导出完整备份。

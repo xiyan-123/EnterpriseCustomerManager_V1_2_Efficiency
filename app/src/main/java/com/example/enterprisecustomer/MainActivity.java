@@ -18,6 +18,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.ContactsContract;
 import android.provider.CallLog;
 import android.text.InputType;
@@ -30,6 +32,7 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -46,6 +49,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -71,6 +75,7 @@ public class MainActivity extends Activity {
     private String currentSearch = "";
     private String currentStatus = "";
     private String currentSpecialFilter = "";
+    private String currentTagFilter = "";
     private long currentGroupId = 0;
     private static final int PAGE_SIZE = 100;
     private int customerVisibleLimit = PAGE_SIZE;
@@ -92,11 +97,38 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        autoBackupBeforeV13Open();
-        db = new CustomerDbHelper(this);
-        buildRoot();
-        render();
-        handleIncomingFile(getIntent());
+        showStartupSplash();
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            autoBackupBeforeV13Open();
+            autoBackupBeforeV132Open();
+            db = new CustomerDbHelper(this);
+            buildRoot();
+            render();
+            handleIncomingFile(getIntent());
+        }, 650);
+    }
+
+    private void showStartupSplash() {
+        LinearLayout splash = new LinearLayout(this);
+        splash.setOrientation(LinearLayout.VERTICAL);
+        splash.setGravity(Gravity.CENTER);
+        splash.setPadding(dp(24), dp(40), dp(24), dp(40));
+        splash.setBackgroundColor(Color.rgb(245, 249, 255));
+        TextView icon = new TextView(this);
+        icon.setText("企");
+        icon.setTextSize(58);
+        icon.setGravity(Gravity.CENTER);
+        icon.setTypeface(Typeface.DEFAULT_BOLD);
+        icon.setTextColor(Color.WHITE);
+        icon.setBackground(round(Color.rgb(30, 94, 255), dp(24), 0));
+        splash.addView(icon, new LinearLayout.LayoutParams(dp(108), dp(108)));
+        TextView title = text("企业客户管家", 30, Color.rgb(22, 38, 64), true);
+        title.setGravity(Gravity.CENTER); title.setPadding(0, dp(28), 0, 0); splash.addView(title);
+        TextView sub = text("企业客户资料与跟进管理", 16, Color.rgb(90, 103, 125), false);
+        sub.setGravity(Gravity.CENTER); sub.setPadding(0, dp(8), 0, 0); splash.addView(sub);
+        TextView version = text("V1.3.2 阶段性稳定版", 13, Color.rgb(120, 132, 150), false);
+        version.setGravity(Gravity.CENTER); version.setPadding(0, dp(80), 0, 0); splash.addView(version);
+        setContentView(splash);
     }
 
     @Override
@@ -150,7 +182,7 @@ public class MainActivity extends Activity {
         LinearLayout box = vertical(dp(12));
         box.setPadding(dp(14), dp(14), dp(14), dp(14));
         scroll.addView(box);
-        box.addView(header("企业客户管家 V1.3.1", "首页工作台｜客户跟进｜多端备份互传"));
+        box.addView(header("企业客户管家 V1.3.2", "标签体系｜多号码导入｜阶段性稳定版"));
         CustomerDbHelper.Stats s = db.getStats();
 
         box.addView(sectionTitle("今日工作"));
@@ -216,7 +248,7 @@ public class MainActivity extends Activity {
         wrapper.addView(search, new LinearLayout.LayoutParams(-1, dp(44)));
         LinearLayout searchOps = horizontal(0); wrapper.addView(searchOps);
         searchOps.addView(smallButton("搜索", v -> { currentSearch = search.getText().toString(); customerVisibleLimit = PAGE_SIZE; render(); }), weightLp());
-        searchOps.addView(smallButton("清空", v -> { currentSearch = ""; currentStatus = ""; currentSpecialFilter = ""; currentGroupId = 0; customerVisibleLimit = PAGE_SIZE; render(); }), weightLp());
+        searchOps.addView(smallButton("清空", v -> { currentSearch = ""; currentStatus = ""; currentSpecialFilter = ""; currentTagFilter = ""; currentGroupId = 0; customerVisibleLimit = PAGE_SIZE; render(); }), weightLp());
         searchOps.addView(smallButton("新增企业", v -> showCompanyEditor(0)), weightLp());
         LinearLayout batchOps = horizontal(0); wrapper.addView(batchOps);
         batchOps.addView(smallButton("批量操作", v -> showBatchActionsDialog()), weightLp());
@@ -226,7 +258,7 @@ public class MainActivity extends Activity {
         ScrollView listScroll = scroll();
         LinearLayout list = vertical(dp(8));
         listScroll.addView(list);
-        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, customerVisibleLimit, 0);
+        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, currentTagFilter, customerVisibleLimit, 0);
         if (companies.isEmpty()) list.addView(emptyBox("暂无客户数据", "可先导入 Excel、智能粘贴录入或手动新增企业"));
         for (CustomerDbHelper.CompanyItem c : companies) list.addView(companyCard(c));
         if (companies.size() >= customerVisibleLimit) {
@@ -242,22 +274,40 @@ public class MainActivity extends Activity {
         HorizontalScrollView hsv = new HorizontalScrollView(this);
         LinearLayout bar = horizontal(0);
         hsv.addView(bar);
-        bar.addView(chip("全部", currentStatus.equals("") && currentSpecialFilter.equals(""), v -> { currentStatus = ""; currentSpecialFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("未设置", CustomerDbHelper.STATUS_NONE.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_NONE; currentSpecialFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("关注", CustomerDbHelper.STATUS_FOCUS.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOCUS; currentSpecialFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("跟进", CustomerDbHelper.STATUS_FOLLOW.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOLLOW; currentSpecialFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("潜力", CustomerDbHelper.STATUS_IMPORTANT.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_IMPORTANT; currentSpecialFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("全部", currentStatus.equals("") && currentSpecialFilter.equals("") && currentTagFilter.equals(""), v -> { currentStatus = ""; currentSpecialFilter = ""; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("未设置", CustomerDbHelper.STATUS_NONE.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_NONE; currentSpecialFilter = ""; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("关注", CustomerDbHelper.STATUS_FOCUS.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOCUS; currentSpecialFilter = ""; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("跟进", CustomerDbHelper.STATUS_FOLLOW.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOLLOW; currentSpecialFilter = ""; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("潜力", CustomerDbHelper.STATUS_IMPORTANT.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_IMPORTANT; currentSpecialFilter = ""; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("未导入通讯录", "unimported".equals(currentSpecialFilter), v -> { currentSpecialFilter = "unimported"; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("无电话", "no_phone".equals(currentSpecialFilter), v -> { currentSpecialFilter = "no_phone"; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("有电话", "has_phone".equals(currentSpecialFilter), v -> { currentSpecialFilter = "has_phone"; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("有备注", "has_note".equals(currentSpecialFilter), v -> { currentSpecialFilter = "has_note"; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("最近更新", "recent".equals(currentSpecialFilter), v -> { currentSpecialFilter = "recent"; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("最近更新", "recent".equals(currentSpecialFilter), v -> { currentSpecialFilter = "recent"; currentTagFilter = ""; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip(CustomerDbHelper.empty(currentTagFilter) ? "按标签" : "标签:" + currentTagFilter, !CustomerDbHelper.empty(currentTagFilter), v -> showTagFilterDialog()));
         bar.addView(chip("全部分组", currentGroupId == 0, v -> { currentGroupId = 0; customerVisibleLimit = PAGE_SIZE; render(); }));
         for (CustomerDbHelper.GroupItem g : db.getGroups()) {
             bar.addView(chip(g.name, currentGroupId == g.id, v -> { currentGroupId = g.id; customerVisibleLimit = PAGE_SIZE; render(); }));
         }
         hsv.setPadding(0, dp(8), 0, dp(8));
         return hsv;
+    }
+
+
+    private void showTagFilterDialog() {
+        List<CustomerDbHelper.TagItem> tags = db.getAllTagsWithCounts();
+        ArrayList<String> opts = new ArrayList<>();
+        opts.add("清除标签筛选");
+        for (CustomerDbHelper.TagItem t : tags) if (t.companyCount > 0) opts.add(t.name + "（" + t.companyCount + "家）");
+        new AlertDialog.Builder(this).setTitle("按标签筛选").setItems(opts.toArray(new String[0]), (d, which) -> {
+            if (which == 0) currentTagFilter = "";
+            else {
+                String v = opts.get(which);
+                int p = v.indexOf('（');
+                currentTagFilter = p > 0 ? v.substring(0, p) : v;
+            }
+            customerVisibleLimit = PAGE_SIZE; render();
+        }).setNegativeButton("取消", null).show();
     }
 
     private View companyCard(CustomerDbHelper.CompanyItem c) {
@@ -306,7 +356,7 @@ public class MainActivity extends Activity {
         box.addView(text("参保人数：" + nvl(c.employeeCount, "未填写"), 14, Color.rgb(90, 103, 125), false));
         box.addView(text("区域：" + nvl(c.region, "未填写"), 14, Color.rgb(90, 103, 125), false));
         box.addView(text("地址：" + nvl(c.address, "未填写"), 14, Color.rgb(90, 103, 125), false));
-        if (!CustomerDbHelper.empty(c.tags)) box.addView(text("标签：" + c.tags, 14, Color.rgb(90, 103, 125), false));
+        box.addView(tagSection(c.id));
         if (!CustomerDbHelper.empty(c.extraInfo)) box.addView(text("扩展信息：" + c.extraInfo, 14, Color.rgb(90, 103, 125), false));
         box.addView(sectionTitle("客户状态"));
         LinearLayout stat = horizontal(0);
@@ -367,6 +417,40 @@ public class MainActivity extends Activity {
         box.addView(smallButton("删除企业", v -> confirmDeleteCompany(c.id)));
         AlertDialog dialog = new AlertDialog.Builder(this).setView(scroll).setPositiveButton("关闭", null).create();
         dialog.show();
+    }
+
+
+    private View tagSection(long companyId) {
+        LinearLayout box = vertical(dp(6));
+        box.addView(sectionTitle("客户标签"));
+        LinearLayout line = horizontal(0);
+        List<String> tags = db.getCompanyTagNames(companyId);
+        if (tags.isEmpty()) line.addView(text("暂无标签", 14, Color.GRAY, false));
+        for (String tag : tags) {
+            TextView tv = chip(tag, false, v -> confirm("移除标签", "确认从该企业移除标签：" + tag + "？", () -> { db.removeTagFromCompany(companyId, tag); showCompanyDetail(companyId); }));
+            line.addView(tv);
+        }
+        box.addView(line);
+        box.addView(smallButton("+ 添加标签", v -> showAddTagToCompanyDialog(companyId)));
+        return box;
+    }
+
+    private void showAddTagToCompanyDialog(long companyId) {
+        List<CustomerDbHelper.TagItem> tags = db.getAllTagsWithCounts();
+        ArrayList<String> opts = new ArrayList<>();
+        opts.add("手动输入新标签");
+        for (CustomerDbHelper.TagItem t : tags) opts.add(t.name);
+        new AlertDialog.Builder(this).setTitle("添加标签").setItems(opts.toArray(new String[0]), (d, which) -> {
+            if (which == 0) showManualAddTag(companyId);
+            else { db.addTagToCompany(companyId, opts.get(which)); showCompanyDetail(companyId); }
+        }).setNegativeButton("取消", null).show();
+    }
+
+    private void showManualAddTag(long companyId) {
+        EditText e = edit("输入标签，多个可用；分隔", "");
+        new AlertDialog.Builder(this).setTitle("添加标签").setView(e).setNegativeButton("取消", null).setPositiveButton("添加", (d,w)->{
+            db.addTagToCompany(companyId, e.getText().toString()); showCompanyDetail(companyId);
+        }).show();
     }
 
     private void showCompanyEditor(long companyId) {
@@ -547,6 +631,11 @@ public class MainActivity extends Activity {
         b3.addView(primaryButton("备份记录", v -> showBackupLogs()), weightLp());
         b3.addView(primaryButton("基准时间", v -> showIncrementalBaseDialog()), weightLp());
 
+        box.addView(sectionTitle("标签体系"));
+        LinearLayout tagOps = horizontal(0); box.addView(tagOps);
+        tagOps.addView(primaryButton("标签管理", v -> showTagManagement()), weightLp());
+        tagOps.addView(primaryButton("按标签筛选", v -> { currentTab = 1; showTagFilterDialog(); }), weightLp());
+
         box.addView(sectionTitle("数据维护"));
         LinearLayout m1 = horizontal(0); box.addView(m1);
         m1.addView(primaryButton("重建缓存", v -> runMaintenance("重建缓存", () -> db.rebuildAllCaches())), weightLp());
@@ -555,6 +644,10 @@ public class MainActivity extends Activity {
         m2.addView(primaryButton("压缩数据库", v -> runMaintenance("压缩数据库", () -> db.vacuumDatabase())), weightLp());
         m2.addView(primaryButton("号码质量清洗", v -> showPhoneCleanPage()), weightLp());
         box.addView(primaryButton("疑似重复企业检测", v -> showDuplicateSuspects()));
+        LinearLayout m3 = horizontal(0); box.addView(m3);
+        m3.addView(primaryButton("数据体检", v -> showDataHealth()), weightLp());
+        m3.addView(primaryButton("清理历史日志", v -> confirm("清理历史日志", "将保留最近500条操作/导入日志，清理更早记录。是否继续？", () -> runMaintenance("清理历史日志", () -> db.cleanOldLogs(500)))), weightLp());
+        box.addView(primaryButton("清理90天前未处理通话记录", v -> confirm("清理通话记录", "仅清理90天前未处理/已忽略/无效通话记录，不影响客户和跟进记录。是否继续？", () -> runMaintenance("清理通话记录", () -> db.cleanOldCallRecords(90)))));
 
         box.addView(sectionTitle("日志与异常"));
         LinearLayout l1 = horizontal(0); box.addView(l1);
@@ -567,6 +660,54 @@ public class MainActivity extends Activity {
         box.addView(sectionTitle("危险操作"));
         box.addView(primaryButton("清空全部App数据", v -> confirm("危险操作", "清空后无法恢复，且不会删除手机通讯录。建议先完整备份。确认清空？", () -> { deleteDatabase(CustomerDbHelper.DB_NAME); db = new CustomerDbHelper(this); render(); })));
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
+    }
+
+
+    private void showTagManagement() {
+        ScrollView scroll = scroll();
+        LinearLayout box = vertical(dp(8)); box.setPadding(dp(12), dp(8), dp(12), dp(8)); scroll.addView(box);
+        box.addView(titleRow("标签管理", "统计、筛选、重命名、合并和删除客户标签"));
+        List<CustomerDbHelper.TagItem> tags = db.getAllTagsWithCounts();
+        if (tags.isEmpty()) box.addView(emptyBox("暂无标签", "可在企业详情、Excel导入或智能粘贴录入中添加标签"));
+        for (CustomerDbHelper.TagItem t : tags) {
+            LinearLayout card = card();
+            card.addView(text(t.name + "｜" + t.companyCount + "家企业", 16, Color.rgb(22,38,64), true));
+            LinearLayout ops = horizontal(0); card.addView(ops);
+            ops.addView(smallButton("查看客户", v -> { currentTab = 1; currentTagFilter = t.name; customerVisibleLimit = PAGE_SIZE; render(); }), weightLp());
+            ops.addView(smallButton("重命名", v -> showRenameTagDialog(t.name, t.companyCount)), weightLp());
+            ops.addView(smallButton("合并", v -> showMergeTagDialog(t.name, t.companyCount)), weightLp());
+            ops.addView(smallButton("删除", v -> confirm("删除标签", "标签“" + t.name + "”当前关联 " + t.companyCount + " 家企业。删除后这些企业都会移除此标签。是否继续？", () -> { db.deleteTag(t.name); showTagManagement(); })), weightLp());
+            box.addView(card);
+        }
+        new AlertDialog.Builder(this).setView(scroll).setPositiveButton("关闭", null).show();
+    }
+
+    private void showRenameTagDialog(String oldName, int count) {
+        EditText e = edit("新标签名称", oldName);
+        new AlertDialog.Builder(this).setTitle("重命名标签").setMessage("当前影响 " + count + " 家企业。")
+                .setView(e).setNegativeButton("取消", null).setPositiveButton("确认", (d,w)->{ db.renameTag(oldName, e.getText().toString()); showTagManagement(); }).show();
+    }
+
+    private void showMergeTagDialog(String fromName, int count) {
+        EditText e = edit("合并到目标标签", "有意向");
+        new AlertDialog.Builder(this).setTitle("合并标签").setMessage("将把“" + fromName + "”合并到目标标签，预计影响 " + count + " 家企业，重复关联会自动跳过。")
+                .setView(e).setNegativeButton("取消", null).setPositiveButton("确认", (d,w)->{ db.mergeTags(fromName, e.getText().toString()); showTagManagement(); }).show();
+    }
+
+    private void showDataHealth() {
+        CustomerDbHelper.DataHealth h = db.getDataHealth();
+        String msg = "企业总数：" + h.companyCount + "\n" +
+                "联系人总数：" + h.contactCount + "\n" +
+                "无电话企业：" + h.noPhoneCompanyCount + "\n" +
+                "重复号码提示：" + h.duplicatePhoneCount + "\n" +
+                "异常号码：" + h.abnormalPhoneCount + "\n" +
+                "标签总数：" + h.tagCount + "\n" +
+                "有标签企业：" + h.tagCompanyCount + "\n" +
+                "无标签企业：" + h.noTagCompanyCount + "\n" +
+                "未完成跟进：" + h.pendingFollowCount + "\n" +
+                "逾期跟进：" + h.overdueFollowCount + "\n\n" +
+                "建议：若长期使用，定期完整备份，并视情况处理无电话企业、异常号码和逾期跟进。";
+        new AlertDialog.Builder(this).setTitle("数据体检").setMessage(msg).setPositiveButton("确定", null).show();
     }
 
     private void runMaintenance(String title, Runnable task) {
@@ -1179,6 +1320,8 @@ public class MainActivity extends Activity {
         if (!CustomerDbHelper.empty(status)) row.put("客户状态", status);
         if (!CustomerDbHelper.empty(nextDate)) row.put("下次跟进日期1", nextDate);
         if (!CustomerDbHelper.empty(followContent)) row.put("跟进内容1", followContent);
+        String suggestedTags = suggestTagsFromText(text);
+        if (!CustomerDbHelper.empty(suggestedTags)) row.put("标签1", suggestedTags);
         int idx = 1;
         for (String ph : phones) {
             String contact = guessNameNearPhone(text, ph);
@@ -1200,6 +1343,23 @@ public class MainActivity extends Activity {
         note = nt.toString();
         if (!CustomerDbHelper.empty(note)) row.put("备注1", note);
         return row;
+    }
+
+
+    private String suggestTagsFromText(String text) {
+        LinkedHashSet<String> tags = new LinkedHashSet<>();
+        String t = text == null ? "" : text;
+        if (t.contains("有意向") || t.contains("意向")) tags.add("有意向");
+        if (t.contains("强意向")) tags.add("强意向");
+        if (t.contains("报价") || t.contains("报过价")) tags.add("已报价");
+        if (t.contains("回访") || t.contains("下次") || t.contains("再联系") || t.contains("跟进")) tags.add("待回访");
+        if (t.contains("价格") || t.contains("贵") || t.contains("偏高")) tags.add("价格敏感");
+        if (t.contains("微信")) tags.add("已加微信");
+        if (t.contains("无效") || t.contains("空号") || t.contains("打不通")) tags.add("号码无效");
+        if (t.contains("暂不需要") || t.contains("不需要")) tags.add("暂不需要");
+        StringBuilder sb = new StringBuilder();
+        for (String tag : tags) { if (sb.length() > 0) sb.append("；"); sb.append(tag); }
+        return sb.toString();
     }
 
     private String guessNameNearPhone(String text, String phone) {
@@ -1250,9 +1410,10 @@ public class MainActivity extends Activity {
             names.add(name); phones.add(phone); stars.add(star); box.addView(name); box.addView(phone); box.addView(star);
         }
         EditText note = edit("备注1", row.get("备注1")); note.setMinLines(3);
+        EditText tagEdit = edit("识别到的标签，可编辑，多个用；分隔", row.get("标签1"));
         EditText follow = edit("跟进内容1", row.get("跟进内容1")); follow.setMinLines(3);
         EditText next = edit("下次跟进日期1，例如 2026-06-30", row.get("下次跟进日期1"));
-        box.addView(text("备注与跟进", 14, Color.rgb(42,58,86), true)); box.addView(note); box.addView(follow); box.addView(next);
+        box.addView(text("备注、标签与跟进", 14, Color.rgb(42,58,86), true)); box.addView(note); box.addView(tagEdit); box.addView(follow); box.addView(next);
         long existedCompany = db.findCompanyByName(row.get("公司名称"));
         if (existedCompany > 0) box.addView(infoCard("已存在企业提示", "检测到企业已存在，确认入库后将合并补充：新电话追加、重复电话跳过、新备注追加，状态只升不降。"));
         new AlertDialog.Builder(this).setTitle("智能粘贴录入预览").setView(box).setNegativeButton("取消", null).setPositiveButton("确认入库", (d,w)->{
@@ -1263,7 +1424,7 @@ public class MainActivity extends Activity {
             for (int i=0;i<phones.size();i++) {
                 if (!CustomerDbHelper.empty(phones.get(i).getText().toString())) { r.put("联系人"+(i+1), names.get(i).getText().toString()); r.put("电话号码"+(i+1), phones.get(i).getText().toString()); r.put("星级"+(i+1), String.valueOf(stars.get(i).getSelectedItemPosition())); }
             }
-            r.put("备注1", note.getText().toString()); r.put("跟进内容1", follow.getText().toString()); r.put("下次跟进日期1", next.getText().toString());
+            r.put("备注1", note.getText().toString()); r.put("标签1", tagEdit.getText().toString()); r.put("跟进内容1", follow.getText().toString()); r.put("下次跟进日期1", next.getText().toString());
             db.importRows(Arrays.asList(r), group == null ? db.ensureGroup("默认分组") : group.id, false, "智能粘贴录入");
             db.logOperation("智能粘贴录入", "粘贴识别入库", company.getText().toString());
             toast("已入库/合并补充"); render();
@@ -1279,9 +1440,11 @@ public class MainActivity extends Activity {
         int idx = methods.indexOf(defaultMethod); if (idx >= 0) method.setSelection(idx);
         EditText content = edit("跟进内容", defaultContent); content.setMinLines(4);
         EditText next = edit("下次跟进日期，例如 2026-06-30，可为空", "");
-        box.addView(text("跟进方式", 13, Color.rgb(42,58,86), true)); box.addView(method); box.addView(content); box.addView(next);
+        EditText tags = edit("快捷标签，例如：有意向；已报价；待回访", "");
+        box.addView(text("跟进方式", 13, Color.rgb(42,58,86), true)); box.addView(method); box.addView(content); box.addView(next); box.addView(tags);
         new AlertDialog.Builder(this).setTitle("新增跟进记录").setView(box).setNegativeButton("取消", null).setPositiveButton("保存", (d,w)->{
             db.addFollowRecord(companyId, (String) method.getSelectedItem(), content.getText().toString(), next.getText().toString());
+            if (!CustomerDbHelper.empty(tags.getText().toString())) db.addTagToCompany(companyId, tags.getText().toString());
             toast("已保存跟进记录"); showCompanyDetail(companyId);
         }).show();
     }
@@ -1445,7 +1608,7 @@ public class MainActivity extends Activity {
     }
 
     private void showBatchGroupDialog() {
-        List<Long> ids = db.getCompanyIdsByFilter(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, 50000);
+        List<Long> ids = db.getCompanyIdsByFilter(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, currentTagFilter, 50000);
         if (ids.isEmpty()) { toast("当前没有可操作的搜索/筛选结果"); return; }
         LinearLayout box = vertical(dp(8)); box.setPadding(dp(16), dp(8), dp(16), dp(8));
         List<CustomerDbHelper.GroupItem> groups = db.getGroups();
@@ -1462,23 +1625,38 @@ public class MainActivity extends Activity {
     }
 
     private void importCurrentSearchContacts() {
-        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, 5000, 0);
+        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, currentTagFilter, 5000, 0);
         ArrayList<CustomerDbHelper.ContactItem> contacts = new ArrayList<>();
         for (CustomerDbHelper.CompanyItem c : companies) contacts.addAll(db.getContacts(c.id, false));
         importContactsWithPreview(contacts);
     }
 
     private void showBatchActionsDialog() {
-        List<Long> ids = db.getCompanyIdsByFilter(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, 50000);
+        List<Long> ids = db.getCompanyIdsByFilter(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, currentTagFilter, 50000);
         if (ids.isEmpty()) { toast("当前没有可批量操作的客户"); return; }
-        String[] opts = {"加入分组", "导入通讯录", "导出 Excel", "批量设置状态"};
+        String[] opts = {"加入分组", "导入通讯录", "导出 Excel", "批量设置状态", "批量添加标签", "批量移除标签"};
         new AlertDialog.Builder(this).setTitle("批量操作：当前筛选 " + ids.size() + " 家企业")
                 .setItems(opts, (d, which) -> {
                     if (which == 0) showBatchGroupDialog();
                     else if (which == 1) importCurrentSearchContacts();
                     else if (which == 2) exportCurrentFilter();
-                    else showBatchSetStatusDialog(ids);
+                    else if (which == 3) showBatchSetStatusDialog(ids);
+                    else if (which == 4) showBatchTagDialog(ids, true);
+                    else showBatchTagDialog(ids, false);
                 }).setNegativeButton("取消", null).show();
+    }
+
+
+    private void showBatchTagDialog(List<Long> ids, boolean add) {
+        EditText e = edit(add ? "要添加的标签，多个可用；分隔" : "要移除的标签", "");
+        new AlertDialog.Builder(this).setTitle(add ? "批量添加标签" : "批量移除标签")
+                .setMessage("当前将影响 " + ids.size() + " 家企业。")
+                .setView(e).setNegativeButton("取消", null).setPositiveButton("确认", (d,w)->{
+                    String tag = e.getText().toString();
+                    if (CustomerDbHelper.empty(tag)) { toast("标签不能为空"); return; }
+                    if (add) db.batchAddTag(ids, tag); else db.batchRemoveTag(ids, tag);
+                    toast("批量标签操作完成"); render();
+                }).show();
     }
 
     private void showBatchSetStatusDialog(List<Long> ids) {
@@ -1492,7 +1670,7 @@ public class MainActivity extends Activity {
     }
 
     private void exportCurrentFilter() {
-        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, 100000, 0);
+        List<CustomerDbHelper.CompanyItem> companies = db.getCompaniesPage(currentSearch, currentStatus, currentGroupId, currentSpecialFilter, currentTagFilter, 100000, 0);
         prepareExport("当前筛选", companies);
     }
 
@@ -1537,6 +1715,22 @@ public class MainActivity extends Activity {
                 copyFile(dbFile, out);
             }
             sp.edit().putBoolean("v13_auto_backup_done", true).apply();
+        } catch (Exception ignored) {}
+    }
+
+
+    private void autoBackupBeforeV132Open() {
+        try {
+            SharedPreferences sp = getSharedPreferences("upgrade", MODE_PRIVATE);
+            if (sp.getBoolean("v132_auto_backup_done", false)) return;
+            File dbFile = getDatabasePath(CustomerDbHelper.DB_NAME);
+            if (dbFile.exists()) {
+                File dir = new File(getExternalFilesDir(null), "backups");
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, "企业客户管家_V132升级前自动备份_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.CHINA).format(new Date()) + ".db");
+                copyFile(dbFile, out);
+            }
+            sp.edit().putBoolean("v132_auto_backup_done", true).apply();
         } catch (Exception ignored) {}
     }
 
@@ -1685,10 +1879,11 @@ public class MainActivity extends Activity {
             rows.put(c.id, r);
         }
         ArrayList<String> headers = new ArrayList<>(Arrays.asList("分组", "客户状态", "公司名称", "所属行业", "参保人数", "区域", "地址"));
-        int maxC=1, maxN=1, maxF=1;
-        for (LinkedHashMap<String,String> r : rows.values()) for (String k : r.keySet()) { if (k.startsWith("电话号码")) maxC=Math.max(maxC, parseInt(k.replace("电话号码", ""),1)); if (k.startsWith("备注")) maxN=Math.max(maxN, parseInt(k.replace("备注", ""),1)); if (k.startsWith("跟进内容")) maxF=Math.max(maxF, parseInt(k.replace("跟进内容", ""),1)); }
+        int maxC=1, maxN=1, maxF=1, maxT=1;
+        for (LinkedHashMap<String,String> r : rows.values()) for (String k : r.keySet()) { if (k.startsWith("电话号码")) maxC=Math.max(maxC, parseInt(k.replace("电话号码", ""),1)); if (k.startsWith("备注")) maxN=Math.max(maxN, parseInt(k.replace("备注", ""),1)); if (k.startsWith("跟进内容")) maxF=Math.max(maxF, parseInt(k.replace("跟进内容", ""),1)); if (k.startsWith("标签")) maxT=Math.max(maxT, parseInt(k.replace("标签", ""),1)); }
         for (int i=1;i<=maxC;i++){ headers.add("联系人"+i); headers.add("电话号码"+i); headers.add("星级"+i); }
         for (int i=1;i<=maxN;i++) headers.add("备注"+i);
+        for (int i=1;i<=maxT;i++) headers.add("标签"+i);
         for (int i=1;i<=maxF;i++){ headers.add("跟进方式"+i); headers.add("跟进内容"+i); headers.add("下次跟进日期"+i); }
         pendingExportHeaders = headers; pendingExportRows = new ArrayList<>();
         for (LinkedHashMap<String,String> r : rows.values()) { ArrayList<String> line = new ArrayList<>(); for (String h : headers) line.add(nvl(r.get(h), "")); pendingExportRows.add(line); }
@@ -1697,7 +1892,9 @@ public class MainActivity extends Activity {
     private LinkedHashMap<String,String> rowForCompany(CustomerDbHelper.CompanyItem c) {
         LinkedHashMap<String,String> r = new LinkedHashMap<>();
         r.put("分组", nvl(c.groupName, "默认分组")); r.put("客户状态", c.statusText()); r.put("公司名称", nvl(c.name, ""));
-        r.put("所属行业", nvl(c.industry, "")); r.put("参保人数", nvl(c.employeeCount, "")); r.put("区域", nvl(c.region, "")); r.put("地址", nvl(c.address, "")); return r;
+        r.put("所属行业", nvl(c.industry, "")); r.put("参保人数", nvl(c.employeeCount, "")); r.put("区域", nvl(c.region, "")); r.put("地址", nvl(c.address, ""));
+        int ti=1; for (String tag : splitSemi(c.tags)) r.put("标签" + (ti++), tag);
+        return r;
     }
 
     private int nextIndex(Map<String,String> row, String prefix) { int i=1; while(row.containsKey(prefix+i) && !CustomerDbHelper.empty(row.get(prefix+i))) i++; return i; }

@@ -20,7 +20,7 @@ import java.util.HashSet;
 
 public class CustomerDbHelper extends SQLiteOpenHelper {
     public static final String DB_NAME = "enterprise_customer_manager.db";
-    public static final int DB_VERSION = 6;
+    public static final int DB_VERSION = 7;
 
     public static final String STATUS_NONE = "未设置";
     public static final String STATUS_FOCUS = "关注";
@@ -80,6 +80,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
                 "created_at TEXT NOT NULL" +
                 ")");
         createIndexesAndMaintenanceTables(db);
+        seedDefaultTags(db);
         ContentValues cv = new ContentValues();
         cv.put("name", "默认分组");
         cv.put("created_at", now());
@@ -109,7 +110,12 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             // V1.3.1：备份互传与体验增强版。只补充索引/维护表，不破坏旧数据。
             tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
         }
+        if (oldVersion < 7) {
+            // V1.3.2：客户标签体系增强与多号码导入修正版。
+            tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
+        }
         createIndexesAndMaintenanceTables(db);
+        migrateLegacyTags(db);
         rebuildAllCaches(db);
     }
 
@@ -149,12 +155,230 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         tryExec(db, "ALTER TABLE backup_logs ADD COLUMN company_count INTEGER DEFAULT 0");
         tryExec(db, "ALTER TABLE backup_logs ADD COLUMN contact_count INTEGER DEFAULT 0");
         tryExec(db, "ALTER TABLE backup_logs ADD COLUMN note_count INTEGER DEFAULT 0");
+
+        tryExec(db, "CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+        tryExec(db, "CREATE TABLE IF NOT EXISTS company_tags (company_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(company_id, tag_id))");
+        tryExec(db, "CREATE INDEX IF NOT EXISTS idx_tags_norm ON tags(normalized_name)");
+        tryExec(db, "CREATE INDEX IF NOT EXISTS idx_company_tags_tag ON company_tags(tag_id, company_id)");
+        tryExec(db, "CREATE INDEX IF NOT EXISTS idx_company_tags_company ON company_tags(company_id)");
         tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
     }
 
     public static String now() {
         return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(new Date());
     }
+
+    private static final String[] DEFAULT_TAGS = new String[]{
+            "有意向","强意向","待报价","已报价","待回访","暂不需要",
+            "老板电话","法人电话","采购电话","号码无效","空号","资料待完善",
+            "老客户","新客户","转介绍","已加微信","已成交",
+            "设备采购","设备租赁","售后需求","价格敏感","急需","长期跟进",
+            "无效客户","拒绝联系","暂不合作","信息不准"
+    };
+
+    public static String normalizeTagName(String s) {
+        if (s == null) return "";
+        String t = s.trim().replace('；', ';').replace('，', ',').replace('、', ',');
+        t = t.replaceAll("\\s+", "");
+        return t;
+    }
+
+    private void seedDefaultTags(SQLiteDatabase db) {
+        for (String tag : DEFAULT_TAGS) ensureTag(db, tag);
+    }
+
+    private void migrateLegacyTags(SQLiteDatabase db) {
+        try {
+            seedDefaultTags(db);
+            Cursor c = db.rawQuery("SELECT id,tags FROM companies WHERE tags IS NOT NULL AND tags<>''", null);
+            int linked = 0;
+            try {
+                while (c.moveToNext()) {
+                    long companyId = c.getLong(0);
+                    String tags = c.getString(1);
+                    linked += addTagsToCompany(db, companyId, tags);
+                    syncCompanyTagsText(db, companyId);
+                }
+            } finally { c.close(); }
+            logOperationRaw(db, "标签迁移", "旧标签迁移完成", "建立/确认企业标签关联 " + linked + " 条");
+        } catch (Exception ignored) {}
+    }
+
+    private void logOperationRaw(SQLiteDatabase db, String type, String title, String detail) {
+        try {
+            ContentValues cv = new ContentValues();
+            cv.put("type", nonNull(type)); cv.put("title", nonNull(title)); cv.put("detail", nonNull(detail)); cv.put("created_at", now());
+            db.insert("operation_logs", null, cv);
+        } catch (Exception ignored) {}
+    }
+
+    private long ensureTag(SQLiteDatabase db, String name) {
+        String n = normalizeTagName(name);
+        if (empty(n)) return -1;
+        Cursor c = db.rawQuery("SELECT id FROM tags WHERE normalized_name=?", new String[]{n});
+        try { if (c.moveToFirst()) return c.getLong(0); } finally { c.close(); }
+        ContentValues cv = new ContentValues();
+        cv.put("name", n); cv.put("normalized_name", n); cv.put("created_at", now()); cv.put("updated_at", now());
+        return db.insert("tags", null, cv);
+    }
+
+    private int addTagsToCompany(SQLiteDatabase db, long companyId, String tagText) {
+        int count = 0;
+        for (String tag : splitTagText(tagText)) {
+            long tagId = ensureTag(db, tag);
+            if (tagId <= 0) continue;
+            ContentValues cv = new ContentValues();
+            cv.put("company_id", companyId); cv.put("tag_id", tagId); cv.put("created_at", now());
+            long r = db.insertWithOnConflict("company_tags", null, cv, SQLiteDatabase.CONFLICT_IGNORE);
+            if (r > 0) count++;
+        }
+        if (count > 0) syncCompanyTagsText(db, companyId);
+        return count;
+    }
+
+    private List<String> splitTagText(String tagText) {
+        ArrayList<String> list = new ArrayList<>();
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (tagText == null) return list;
+        String t = tagText.replace('\n', '；').replace('\r', '；').replace(',', '；').replace('，', '；').replace('、', '；').replace(';', '；');
+        for (String p : t.split("；")) {
+            String n = normalizeTagName(p);
+            if (!empty(n)) set.add(n);
+        }
+        list.addAll(set);
+        return list;
+    }
+
+    private String tagsStringFromTables(SQLiteDatabase db, long companyId) {
+        StringBuilder sb = new StringBuilder();
+        Cursor c = db.rawQuery("SELECT t.name FROM tags t JOIN company_tags ct ON t.id=ct.tag_id WHERE ct.company_id=? ORDER BY t.name", new String[]{String.valueOf(companyId)});
+        try {
+            while (c.moveToNext()) { if (sb.length() > 0) sb.append("；"); sb.append(c.getString(0)); }
+        } finally { c.close(); }
+        return sb.toString();
+    }
+
+    private void syncCompanyTagsText(SQLiteDatabase db, long companyId) {
+        String tags = tagsStringFromTables(db, companyId);
+        int tagCount = 0;
+        if (!empty(tags)) for (String ignored : tags.split("；")) tagCount++;
+        ContentValues cv = new ContentValues();
+        cv.put("tags", tags); cv.put("tag_count", tagCount); cv.put("updated_at", now());
+        db.update("companies", cv, "id=?", new String[]{String.valueOf(companyId)});
+    }
+
+    public List<TagItem> getAllTagsWithCounts() {
+        ArrayList<TagItem> list = new ArrayList<>();
+        SQLiteDatabase db = getWritableDatabase();
+        createIndexesAndMaintenanceTables(db);
+        migrateLegacyTags(db);
+        Cursor c = db.rawQuery("SELECT t.id,t.name,COUNT(ct.company_id) cnt FROM tags t LEFT JOIN company_tags ct ON t.id=ct.tag_id GROUP BY t.id,t.name ORDER BY cnt DESC,t.name ASC", null);
+        try { while (c.moveToNext()) { TagItem it = new TagItem(); it.id=c.getLong(0); it.name=c.getString(1); it.companyCount=c.getInt(2); list.add(it); } } finally { c.close(); }
+        return list;
+    }
+
+    public List<String> getCompanyTagNames(long companyId) {
+        ArrayList<String> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT t.name FROM tags t JOIN company_tags ct ON t.id=ct.tag_id WHERE ct.company_id=? ORDER BY t.name", new String[]{String.valueOf(companyId)});
+        try { while (c.moveToNext()) list.add(c.getString(0)); } finally { c.close(); }
+        if (list.isEmpty()) {
+            CompanyItem cpy = getCompany(companyId);
+            list.addAll(splitTagText(cpy.tags));
+        }
+        return list;
+    }
+
+    public int addTagToCompany(long companyId, String tagName) {
+        SQLiteDatabase db = getWritableDatabase();
+        int n = addTagsToCompany(db, companyId, tagName);
+        updateCompanyCache(db, companyId); rebuildStatsCache(db);
+        if (n > 0) logOperation("标签", "添加标签", "企业ID=" + companyId + " 标签=" + tagName);
+        return n;
+    }
+
+    public void removeTagFromCompany(long companyId, String tagName) {
+        String norm = normalizeTagName(tagName);
+        if (empty(norm)) return;
+        SQLiteDatabase db = getWritableDatabase();
+        long tagId = -1;
+        Cursor c = db.rawQuery("SELECT id FROM tags WHERE normalized_name=?", new String[]{norm});
+        try { if (c.moveToFirst()) tagId = c.getLong(0); } finally { c.close(); }
+        if (tagId > 0) db.delete("company_tags", "company_id=? AND tag_id=?", new String[]{String.valueOf(companyId), String.valueOf(tagId)});
+        syncCompanyTagsText(db, companyId); updateCompanyCache(db, companyId); rebuildStatsCache(db);
+        logOperation("标签", "移除企业标签", "企业ID=" + companyId + " 标签=" + tagName);
+    }
+
+    public int batchAddTag(List<Long> companyIds, String tagName) {
+        if (companyIds == null || companyIds.isEmpty()) return 0;
+        SQLiteDatabase db = getWritableDatabase(); int n = 0;
+        db.beginTransaction();
+        try { for (Long id : companyIds) { n += addTagsToCompany(db, id, tagName); updateCompanyCache(db, id); } rebuildStatsCache(db); db.setTransactionSuccessful(); }
+        finally { db.endTransaction(); }
+        logOperation("标签", "批量添加标签", "数量=" + companyIds.size() + " 标签=" + tagName);
+        return n;
+    }
+
+    public int batchRemoveTag(List<Long> companyIds, String tagName) {
+        if (companyIds == null || companyIds.isEmpty()) return 0;
+        SQLiteDatabase db = getWritableDatabase(); String norm = normalizeTagName(tagName); int n = 0; long tagId = -1;
+        Cursor c = db.rawQuery("SELECT id FROM tags WHERE normalized_name=?", new String[]{norm});
+        try { if (c.moveToFirst()) tagId = c.getLong(0); } finally { c.close(); }
+        if (tagId <= 0) return 0;
+        db.beginTransaction();
+        try { for (Long id : companyIds) { n += db.delete("company_tags", "company_id=? AND tag_id=?", new String[]{String.valueOf(id), String.valueOf(tagId)}); syncCompanyTagsText(db, id); updateCompanyCache(db, id); } rebuildStatsCache(db); db.setTransactionSuccessful(); }
+        finally { db.endTransaction(); }
+        logOperation("标签", "批量移除标签", "数量=" + companyIds.size() + " 标签=" + tagName);
+        return n;
+    }
+
+    public void renameTag(String oldName, String newName) {
+        String oldNorm = normalizeTagName(oldName), newNorm = normalizeTagName(newName);
+        if (empty(oldNorm) || empty(newNorm)) return;
+        SQLiteDatabase db = getWritableDatabase();
+        long oldId = ensureTag(db, oldName); long newId = ensureTag(db, newName);
+        if (oldId == newId) return;
+        db.beginTransaction();
+        try {
+            db.execSQL("INSERT OR IGNORE INTO company_tags(company_id,tag_id,created_at) SELECT company_id," + newId + ",created_at FROM company_tags WHERE tag_id=" + oldId);
+            db.delete("company_tags", "tag_id=?", new String[]{String.valueOf(oldId)});
+            db.delete("tags", "id=?", new String[]{String.valueOf(oldId)});
+            Cursor c = db.rawQuery("SELECT DISTINCT company_id FROM company_tags WHERE tag_id=?", new String[]{String.valueOf(newId)});
+            try { while (c.moveToNext()) syncCompanyTagsText(db, c.getLong(0)); } finally { c.close(); }
+            rebuildAllCaches(db); db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+        logOperation("标签", "重命名标签", oldName + " → " + newName);
+    }
+
+    public void mergeTags(String fromName, String toName) { renameTag(fromName, toName); }
+
+    public void deleteTag(String tagName) {
+        String norm = normalizeTagName(tagName); if (empty(norm)) return;
+        SQLiteDatabase db = getWritableDatabase(); long tagId = -1;
+        Cursor c = db.rawQuery("SELECT id FROM tags WHERE normalized_name=?", new String[]{norm});
+        try { if (c.moveToFirst()) tagId = c.getLong(0); } finally { c.close(); }
+        if (tagId <= 0) return;
+        ArrayList<Long> affected = new ArrayList<>();
+        Cursor a = db.rawQuery("SELECT company_id FROM company_tags WHERE tag_id=?", new String[]{String.valueOf(tagId)});
+        try { while (a.moveToNext()) affected.add(a.getLong(0)); } finally { a.close(); }
+        db.beginTransaction();
+        try { db.delete("company_tags", "tag_id=?", new String[]{String.valueOf(tagId)}); db.delete("tags", "id=?", new String[]{String.valueOf(tagId)}); for (Long id : affected) syncCompanyTagsText(db, id); rebuildAllCaches(db); db.setTransactionSuccessful(); }
+        finally { db.endTransaction(); }
+        logOperation("标签", "删除标签", "标签=" + tagName + " 影响企业=" + affected.size());
+    }
+
+    public int countCompaniesByTag(String tagName) {
+        String norm = normalizeTagName(tagName); if (empty(norm)) return 0;
+        SQLiteDatabase db = getReadableDatabase();
+        Cursor c = db.rawQuery("SELECT COUNT(DISTINCT ct.company_id) FROM company_tags ct JOIN tags t ON ct.tag_id=t.id WHERE t.normalized_name=?", new String[]{norm});
+        try { return c.moveToFirst() ? c.getInt(0) : 0; } finally { c.close(); }
+    }
+
+    private boolean companyHasTag(SQLiteDatabase db, long companyId, String tagName) {
+        String norm = normalizeTagName(tagName); if (empty(norm)) return true;
+        Cursor c = db.rawQuery("SELECT 1 FROM company_tags ct JOIN tags t ON ct.tag_id=t.id WHERE ct.company_id=? AND t.normalized_name=? LIMIT 1", new String[]{String.valueOf(companyId), norm});
+        try { return c.moveToFirst(); } finally { c.close(); }
+    }
+
 
     public static String normalizeCompany(String s) {
         if (s == null) return "";
@@ -172,6 +396,28 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         if (t.startsWith("+86")) t = t.substring(3);
         if (t.startsWith("86") && t.length() == 13) t = t.substring(2);
         return t;
+    }
+
+    public static List<String> splitPhones(String raw) {
+        ArrayList<String> out = new ArrayList<>();
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (raw == null) return out;
+        String text = raw.trim();
+        if (text.isEmpty()) return out;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\+?86[-\\s]?)?(1[3-9]\\d{9}|0\\d{2,3}[-\\s]?\\d{7,8}|400[-\\s]?\\d{3}[-\\s]?\\d{4})").matcher(text);
+        while (m.find()) {
+            String n = normalizePhone(m.group());
+            if (!empty(n) && n.length() >= 5) set.add(n);
+        }
+        if (set.isEmpty()) {
+            String t = text.replace('，', ',').replace('、', ',').replace('；', ',').replace(';', ',').replace('/', ',').replace('\\', ',').replace('\n', ',').replace('\r', ',').replace('\t', ',');
+            for (String p : t.split(",|\\s+")) {
+                String n = normalizePhone(p);
+                if (!empty(n) && n.length() >= 5) set.add(n);
+            }
+        }
+        out.addAll(set);
+        return out;
     }
 
     public static String nonNull(String s) { return s == null ? "" : s; }
@@ -302,10 +548,14 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         int contactCount = intQuery(db, "SELECT COUNT(*) FROM contacts WHERE company_id=" + companyId);
         int noteCount = intQuery(db, "SELECT COUNT(*) FROM notes WHERE company_id=" + companyId);
         int importedCount = intQuery(db, "SELECT COUNT(*) FROM contacts WHERE company_id=" + companyId + " AND imported=1");
+        String tagsFromTable = tagsStringFromTables(db, companyId);
+        if (!empty(tagsFromTable)) {
+            ContentValues tv = new ContentValues(); tv.put("tags", tagsFromTable);
+            db.update("companies", tv, "id=?", new String[]{String.valueOf(companyId)});
+        }
         CompanyItem c = getCompanyLight(db, companyId);
         String searchText = buildSearchText(db, companyId, c);
-        int tagCount = 0;
-        for (String part : nonNull(c.tags).split("；|;")) if (!empty(part)) tagCount++;
+        int tagCount = intQuery(db, "SELECT COUNT(*) FROM company_tags WHERE company_id=" + companyId);
         ContentValues cv = new ContentValues();
         cv.put("contact_count", contactCount);
         cv.put("note_count", noteCount);
@@ -441,20 +691,10 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             }
             for (int i=1;i<=80;i++) {
                 String phone = first(row, "电话号码"+i, "手机号"+i, "联系电话"+i, "电话"+i, "手机"+i);
-                if (!empty(phone)) {
-                    String pn = normalizePhone(phone);
-                    if (empty(pn) || pn.length() < 5) { r.phoneAbnormalCount++; r.abnormalRows++; }
-                    else if (companyId > 0 && contactExists(db, companyId, pn)) r.duplicatePhoneCount++;
-                    else r.newPhoneCount++;
-                }
+                if (!empty(phone)) previewPhoneCell(db, r, companyId, phone);
             }
             String phone = first(row, "电话号码", "手机号", "联系电话", "电话", "手机", "移动电话", "联系方式");
-            if (!empty(phone)) {
-                String pn = normalizePhone(phone);
-                if (empty(pn) || pn.length() < 5) { r.phoneAbnormalCount++; r.abnormalRows++; }
-                else if (companyId > 0 && contactExists(db, companyId, pn)) r.duplicatePhoneCount++;
-                else r.newPhoneCount++;
-            }
+            if (!empty(phone)) previewPhoneCell(db, r, companyId, phone);
             for (int i=1;i<=100;i++) {
                 String note = first(row, "备注"+i, "备注信息"+i, "跟进记录"+i, "记录"+i);
                 if (!empty(note)) r.newNotes++;
@@ -469,6 +709,17 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             if (!empty(follow)) r.newFollows++;
         }
         return r;
+    }
+
+    private void previewPhoneCell(SQLiteDatabase db, ImportPreviewResult r, long companyId, String phoneCell) {
+        List<String> phones = splitPhones(phoneCell);
+        if (phones.size() > 1) { r.multiPhoneCellCount++; r.splitPhoneCount += phones.size(); }
+        if (phones.isEmpty()) { r.phoneAbnormalCount++; r.abnormalRows++; return; }
+        for (String pn : phones) {
+            if (empty(pn) || pn.length() < 5) { r.phoneAbnormalCount++; r.abnormalRows++; }
+            else if (companyId > 0 && contactExists(db, companyId, pn)) r.duplicatePhoneCount++;
+            else r.newPhoneCount++;
+        }
     }
 
     private boolean contactExists(SQLiteDatabase db, long companyId, String phoneNorm) {
@@ -529,6 +780,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
                         else if (!empty(importStatus)) result.statusKeepCount++;
                         result.mergedCompanies++;
                     }
+                    countMultiPhoneCells(row, result);
                     int contacts = importContactsForCompany(db, companyId, row);
                     int notes = importNotesForCompany(db, companyId, row);
                     int follows = importFollowRecordsForCompany(db, companyId, row);
@@ -571,11 +823,14 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         cv.put("region", first(row, "区域", "地区", "所在区域"));
         cv.put("address", first(row, "地址", "企业地址", "注册地址", "经营地址"));
         cv.put("customer_status", normalizeStatus(importStatus));
-        cv.put("tags", collectTagValues(row));
+        cv.put("tags", "");
         cv.put("extra_info", collectExtraValues(row));
         cv.put("created_at", now());
         cv.put("updated_at", now());
-        return db.insert("companies", null, cv);
+        long id = db.insert("companies", null, cv);
+        addTagsToCompany(db, id, collectTagValues(row));
+        syncCompanyTagsText(db, id);
+        return id;
     }
 
     private void supplementCompany(SQLiteDatabase db, long companyId, Map<String, String> row) {
@@ -585,9 +840,8 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         putIfOldEmpty(cv, "employee_count", old.employeeCount, first(row, "参保人数", "人数", "员工人数"));
         putIfOldEmpty(cv, "region", old.region, first(row, "区域", "地区", "所在区域"));
         putIfOldEmpty(cv, "address", old.address, first(row, "地址", "企业地址", "注册地址", "经营地址"));
-        String newTags = mergeSemi(old.tags, collectTagValues(row));
+        addTagsToCompany(db, companyId, collectTagValues(row));
         String newExtra = mergeSemi(old.extraInfo, collectExtraValues(row));
-        cv.put("tags", newTags);
         cv.put("extra_info", newExtra);
         cv.put("updated_at", now());
         db.update("companies", cv, "id=?", new String[]{String.valueOf(companyId)});
@@ -595,6 +849,17 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
 
     private void putIfOldEmpty(ContentValues cv, String col, String oldVal, String newVal) {
         if (empty(oldVal) && !empty(newVal)) cv.put(col, newVal.trim());
+    }
+
+    private void countMultiPhoneCells(Map<String, String> row, ImportResult r) {
+        for (int i=1;i<=80;i++) {
+            String phone = first(row, "电话号码"+i, "手机号"+i, "联系电话"+i, "电话"+i, "手机"+i);
+            List<String> phones = splitPhones(phone);
+            if (phones.size() > 1) { r.multiPhoneCellCount++; r.splitPhoneCount += phones.size(); }
+        }
+        String phone = first(row, "电话号码", "手机号", "联系电话", "电话", "手机", "移动电话", "联系方式");
+        List<String> phones = splitPhones(phone);
+        if (phones.size() > 1) { r.multiPhoneCellCount++; r.splitPhoneCount += phones.size(); }
     }
 
     private int importContactsForCompany(SQLiteDatabase db, long companyId, Map<String, String> row) {
@@ -605,14 +870,14 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             String star = first(row, "星级" + i, "号码星级" + i, "重要程度" + i);
             if (!empty(phone) || !empty(name)) {
                 if (empty(phone)) continue;
-                if (addContactIfNew(db, companyId, name, phone, parseStar(star))) count++;
+                for (String one : splitPhones(phone)) if (addContactIfNew(db, companyId, name, one, parseStar(star))) count++;
             }
         }
         String name = first(row, "联系人", "联系人姓名", "姓名");
         String phone = first(row, "电话号码", "手机号", "联系电话", "电话", "手机", "移动电话", "联系方式");
         String star = first(row, "星级", "号码星级", "重要程度");
         if (!empty(phone)) {
-            if (addContactIfNew(db, companyId, name, phone, parseStar(star))) count++;
+            for (String one : splitPhones(phone)) if (addContactIfNew(db, companyId, name, one, parseStar(star))) count++;
         }
         return count;
     }
@@ -715,17 +980,16 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
 
     private int importTagsAndExtraForCompany(SQLiteDatabase db, long companyId, Map<String, String> row) {
         CompanyItem old = getCompany(companyId);
-        String newTags = mergeSemi(old.tags, collectTagValues(row));
+        int addedTags = addTagsToCompany(db, companyId, collectTagValues(row));
         String newExtra = mergeSemi(old.extraInfo, collectExtraValues(row));
-        if (!newTags.equals(nonNull(old.tags)) || !newExtra.equals(nonNull(old.extraInfo))) {
+        if (!newExtra.equals(nonNull(old.extraInfo))) {
             ContentValues cv = new ContentValues();
-            cv.put("tags", newTags);
             cv.put("extra_info", newExtra);
             cv.put("updated_at", now());
             db.update("companies", cv, "id=?", new String[]{String.valueOf(companyId)});
-            return 1;
         }
-        return 0;
+        if (addedTags > 0) syncCompanyTagsText(db, companyId);
+        return addedTags;
     }
 
     private static String mergeSemi(String oldVal, String addVal) {
@@ -995,13 +1259,17 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
     public void updateTags(long companyId, String tags) {
-        ContentValues cv = new ContentValues();
-        cv.put("tags", nonNull(tags));
-        cv.put("updated_at", now());
         SQLiteDatabase db = getWritableDatabase();
-        db.update("companies", cv, "id=?", new String[]{String.valueOf(companyId)});
-        updateCompanyCache(db, companyId);
-        rebuildStatsCache(db);
+        db.beginTransaction();
+        try {
+            db.delete("company_tags", "company_id=?", new String[]{String.valueOf(companyId)});
+            addTagsToCompany(db, companyId, tags);
+            syncCompanyTagsText(db, companyId);
+            updateCompanyCache(db, companyId);
+            rebuildStatsCache(db);
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+        logOperation("标签", "编辑企业标签", "企业ID=" + companyId + " 标签=" + tags);
     }
 
     public List<ContactItem> getContacts(long companyId, Boolean importedOnly) {
@@ -1515,8 +1783,13 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
     public List<CompanyItem> getCompaniesPage(String query, String status, long groupId, String specialFilter, int limit, int offset) {
-        ArrayList<CompanyItem> base = new ArrayList<>(getCompaniesPage(query, status, groupId, Math.max(limit * 3, limit + 100), offset));
-        if (empty(specialFilter)) return base.size() > limit ? new ArrayList<>(base.subList(0, limit)) : base;
+        return getCompaniesPage(query, status, groupId, specialFilter, "", limit, offset);
+    }
+
+    public List<CompanyItem> getCompaniesPage(String query, String status, long groupId, String specialFilter, String tagFilter, int limit, int offset) {
+        ArrayList<CompanyItem> base = new ArrayList<>(getCompaniesPage(query, status, groupId, Math.max(limit * 6, limit + 200), offset));
+        if (empty(specialFilter) && empty(tagFilter)) return base.size() > limit ? new ArrayList<>(base.subList(0, limit)) : base;
+        SQLiteDatabase db = getReadableDatabase();
         ArrayList<CompanyItem> out = new ArrayList<>();
         for (CompanyItem c : base) {
             boolean ok = true;
@@ -1525,6 +1798,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             else if ("has_phone".equals(specialFilter)) ok = c.contactCount > 0;
             else if ("has_note".equals(specialFilter)) ok = c.noteCount > 0;
             else if ("recent".equals(specialFilter)) ok = !empty(c.updatedAt);
+            if (ok && !empty(tagFilter)) ok = companyHasTag(db, c.id, tagFilter);
             if (ok) out.add(c);
             if (out.size() >= limit) break;
         }
@@ -1532,8 +1806,12 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
     public List<Long> getCompanyIdsByFilter(String query, String status, long groupId, String specialFilter, int max) {
+        return getCompanyIdsByFilter(query, status, groupId, specialFilter, "", max);
+    }
+
+    public List<Long> getCompanyIdsByFilter(String query, String status, long groupId, String specialFilter, String tagFilter, int max) {
         ArrayList<Long> ids = new ArrayList<>();
-        List<CompanyItem> list = getCompaniesPage(query, status, groupId, specialFilter, max <= 0 ? 5000 : max, 0);
+        List<CompanyItem> list = getCompaniesPage(query, status, groupId, specialFilter, tagFilter, max <= 0 ? 5000 : max, 0);
         for (CompanyItem c : list) ids.add(c.id);
         return ids;
     }
@@ -1596,14 +1874,54 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         try { return c.moveToFirst() ? c.getLong(0) : -1; } finally { c.close(); }
     }
 
+
+    public DataHealth getDataHealth() {
+        SQLiteDatabase db = getWritableDatabase();
+        createIndexesAndMaintenanceTables(db);
+        migrateLegacyTags(db);
+        DataHealth h = new DataHealth();
+        h.companyCount = intQuery(db, "SELECT COUNT(*) FROM companies");
+        h.contactCount = intQuery(db, "SELECT COUNT(*) FROM contacts");
+        h.noPhoneCompanyCount = intQuery(db, "SELECT COUNT(*) FROM companies c LEFT JOIN contacts ct ON c.id=ct.company_id WHERE ct.id IS NULL");
+        h.duplicatePhoneCount = intQuery(db, "SELECT COUNT(*) FROM (SELECT phone_norm FROM contacts WHERE phone_norm<>'' GROUP BY phone_norm HAVING COUNT(DISTINCT company_id)>1)");
+        h.abnormalPhoneCount = intQuery(db, "SELECT COUNT(*) FROM contacts WHERE LENGTH(phone_norm)<5 OR LENGTH(phone_norm)>13");
+        h.noTagCompanyCount = intQuery(db, "SELECT COUNT(*) FROM companies c LEFT JOIN company_tags ct ON c.id=ct.company_id WHERE ct.company_id IS NULL");
+        h.tagCompanyCount = intQuery(db, "SELECT COUNT(DISTINCT company_id) FROM company_tags");
+        h.overdueFollowCount = getStats().overdueFollowCount;
+        h.pendingFollowCount = intQuery(db, "SELECT COUNT(*) FROM follow_records WHERE done=0");
+        h.tagCount = intQuery(db, "SELECT COUNT(*) FROM tags");
+        return h;
+    }
+
+    public int cleanOldLogs(int keepRecent) {
+        SQLiteDatabase db = getWritableDatabase();
+        int keep = keepRecent <= 0 ? 500 : keepRecent;
+        int n = 0;
+        n += db.delete("operation_logs", "id NOT IN (SELECT id FROM operation_logs ORDER BY id DESC LIMIT " + keep + ")", null);
+        n += db.delete("import_logs", "id NOT IN (SELECT id FROM import_logs ORDER BY id DESC LIMIT " + keep + ")", null);
+        logOperation("日志清理", "清理历史日志", "处理数量=" + n + "，保留最近" + keep + "条");
+        return n;
+    }
+
+    public int cleanOldCallRecords(int days) {
+        SQLiteDatabase db = getWritableDatabase();
+        long before = System.currentTimeMillis() - (days <= 0 ? 90L : (long)days) * 24L * 3600L * 1000L;
+        int n = db.delete("call_records", "call_time<? AND (status='已忽略' OR status='无效' OR status='未处理')", new String[]{String.valueOf(before)});
+        rebuildStatsCache(db);
+        logOperation("通话记录", "清理历史通话记录", "清理" + days + "天前记录=" + n);
+        return n;
+    }
+
     public static class FollowSummary { public int followCount; public String lastFollowTime, nextFollowDate, lastContent; }
     public static class CompanyImpact { public int contactCount, noteCount, followCount, importedCount; }
     public static class BackupLogItem { public long id; public int companyCount, contactCount, noteCount; public String fileName, type, result, createdAt; }
+    public static class TagItem { public long id; public int companyCount; public String name; }
+    public static class DataHealth { public int companyCount, contactCount, noPhoneCompanyCount, duplicatePhoneCount, abnormalPhoneCount, noTagCompanyCount, tagCompanyCount, overdueFollowCount, pendingFollowCount, tagCount; }
 
 
     public static class GroupItem { public long id; public String name; public GroupItem(long i,String n){id=i;name=n;} public String toString(){return name;} }
     public static class Stats { public int companyCount, contactCount, importedCount, statusNone, focusCount, followCount, importantCount, exceptionCount, todayFollowCount, overdueFollowCount, soonFollowCount, callPendingCount; }
-    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newFollows, newTags, skippedNoCompany, duplicateRows, abnormalRows, statusUpgradeCount, statusKeepCount, newPhoneCount, duplicatePhoneCount, phoneAbnormalCount; }
+    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newFollows, newTags, skippedNoCompany, duplicateRows, abnormalRows, statusUpgradeCount, statusKeepCount, newPhoneCount, duplicatePhoneCount, phoneAbnormalCount, multiPhoneCellCount, splitPhoneCount; }
     public static class ImportPreviewResult extends ImportResult { }
 
     public static class CompanyItem {
