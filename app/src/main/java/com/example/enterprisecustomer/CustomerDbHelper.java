@@ -20,7 +20,7 @@ import java.util.HashSet;
 
 public class CustomerDbHelper extends SQLiteOpenHelper {
     public static final String DB_NAME = "enterprise_customer_manager.db";
-    public static final int DB_VERSION = 5;
+    public static final int DB_VERSION = 6;
 
     public static final String STATUS_NONE = "未设置";
     public static final String STATUS_FOCUS = "关注";
@@ -105,6 +105,10 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             // V1.3：只新增表和索引，不删除原有企业、联系人、备注、分组数据。
             tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
         }
+        if (oldVersion < 6) {
+            // V1.3.1：备份互传与体验增强版。只补充索引/维护表，不破坏旧数据。
+            tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
+        }
         createIndexesAndMaintenanceTables(db);
         rebuildAllCaches(db);
     }
@@ -142,6 +146,9 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         tryExec(db, "CREATE INDEX IF NOT EXISTS idx_follow_next ON follow_records(next_follow_date, done)");
         tryExec(db, "CREATE TABLE IF NOT EXISTS duplicate_ignores (key TEXT PRIMARY KEY, created_at TEXT)");
         tryExec(db, "CREATE TABLE IF NOT EXISTS backup_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, file_name TEXT, type TEXT, result TEXT, created_at TEXT)");
+        tryExec(db, "ALTER TABLE backup_logs ADD COLUMN company_count INTEGER DEFAULT 0");
+        tryExec(db, "ALTER TABLE backup_logs ADD COLUMN contact_count INTEGER DEFAULT 0");
+        tryExec(db, "ALTER TABLE backup_logs ADD COLUMN note_count INTEGER DEFAULT 0");
         tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
     }
 
@@ -333,6 +340,10 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         sb.append(nonNull(c.name)).append(' ').append(nonNull(c.groupName)).append(' ').append(nonNull(c.industry)).append(' ').append(nonNull(c.region)).append(' ').append(nonNull(c.address)).append(' ').append(nonNull(c.tags)).append(' ').append(nonNull(c.extraInfo));
         Cursor ct = db.rawQuery("SELECT contact_name,phone FROM contacts WHERE company_id=?", new String[]{String.valueOf(companyId)});
         try { while (ct.moveToNext()) sb.append(' ').append(nonNull(ct.getString(0))).append(' ').append(nonNull(ct.getString(1))); } finally { ct.close(); }
+        Cursor nt = db.rawQuery("SELECT content FROM notes WHERE company_id=?", new String[]{String.valueOf(companyId)});
+        try { while (nt.moveToNext()) sb.append(' ').append(nonNull(nt.getString(0))); } finally { nt.close(); }
+        Cursor fr = db.rawQuery("SELECT follow_method,content,next_follow_date FROM follow_records WHERE company_id=?", new String[]{String.valueOf(companyId)});
+        try { while (fr.moveToNext()) sb.append(' ').append(nonNull(fr.getString(0))).append(' ').append(nonNull(fr.getString(1))).append(' ').append(nonNull(fr.getString(2))); } finally { fr.close(); }
         return sb.toString().toLowerCase(Locale.CHINA);
     }
 
@@ -450,6 +461,12 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             }
             String note = first(row, "备注", "备注信息", "说明");
             if (!empty(note)) r.newNotes++;
+            for (int i=1;i<=20;i++) {
+                String follow = first(row, "跟进内容"+i, "跟进记录内容"+i, "跟进"+i);
+                if (!empty(follow)) r.newFollows++;
+            }
+            String follow = first(row, "跟进内容", "跟进记录内容", "跟进");
+            if (!empty(follow)) r.newFollows++;
         }
         return r;
     }
@@ -514,9 +531,11 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
                     }
                     int contacts = importContactsForCompany(db, companyId, row);
                     int notes = importNotesForCompany(db, companyId, row);
+                    int follows = importFollowRecordsForCompany(db, companyId, row);
                     int tags = importTagsAndExtraForCompany(db, companyId, row);
                     result.newContacts += contacts;
                     result.newNotes += notes;
+                    result.newFollows += follows;
                     result.newTags += tags;
                     if (contacts == 0 && empty(first(row, "电话号码", "手机号", "联系电话", "电话", "手机", "移动电话", "联系方式"))) {
                         // 企业客户允许无电话，不作为错误，只记录为可查看异常提醒
@@ -664,6 +683,36 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         return true;
     }
 
+    private int importFollowRecordsForCompany(SQLiteDatabase db, long companyId, Map<String, String> row) {
+        int count = 0;
+        for (int i = 1; i <= 20; i++) {
+            String content = first(row, "跟进内容" + i, "跟进记录内容" + i, "跟进" + i);
+            String method = first(row, "跟进方式" + i, "跟进方法" + i, "方式" + i);
+            String next = first(row, "下次跟进日期" + i, "下次联系日期" + i, "回访日期" + i);
+            if (!empty(content) || !empty(next)) {
+                if (empty(content)) content = "导入新增跟进";
+                addFollowRecordRaw(db, companyId, method, content, next);
+                count++;
+            }
+        }
+        String content = first(row, "跟进内容", "跟进记录内容", "跟进");
+        String method = first(row, "跟进方式", "跟进方法", "方式");
+        String next = first(row, "下次跟进日期", "下次联系日期", "回访日期");
+        if (!empty(content) || !empty(next)) {
+            if (empty(content)) content = "导入新增跟进";
+            addFollowRecordRaw(db, companyId, method, content, next);
+            count++;
+        }
+        return count;
+    }
+
+    private void addFollowRecordRaw(SQLiteDatabase db, long companyId, String method, String content, String nextDate) {
+        ContentValues cv = new ContentValues();
+        cv.put("company_id", companyId); cv.put("follow_time", now()); cv.put("follow_method", empty(method) ? "其他" : method.trim());
+        cv.put("content", nonNull(content).trim()); cv.put("next_follow_date", nonNull(nextDate).trim()); cv.put("done", 0); cv.put("created_at", now());
+        db.insert("follow_records", null, cv);
+    }
+
     private int importTagsAndExtraForCompany(SQLiteDatabase db, long companyId, Map<String, String> row) {
         CompanyItem old = getCompany(companyId);
         String newTags = mergeSemi(old.tags, collectTagValues(row));
@@ -725,6 +774,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         if (h.matches("标签\\d*|客户标签")) return true;
         if (h.matches("星级\\d*|号码星级\\d*|重要程度\\d*")) return true;
         if (h.equals("客户状态") || h.equals("状态") || h.equals("客户等级") || h.equals("跟进状态")) return true;
+        if (h.matches("跟进方式\\d*|跟进方法\\d*|方式\\d*|跟进内容\\d*|跟进记录内容\\d*|跟进\\d*|下次跟进日期\\d*|下次联系日期\\d*|回访日期\\d*|客户来源")) return true;
         return h.equals("序号") || h.equals("分组") || h.equals("客户分组") || h.equals("组别") ||
                 h.equals("公司名称") || h.equals("企业名称") || h.equals("单位名称") || h.equals("客户名称") || h.equals("公司") || h.equals("企业") || h.equals("名称") ||
                 h.equals("所属行业") || h.equals("行业") || h.equals("经营行业") ||
@@ -1406,9 +1456,154 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
 
+    public int countNotes(long companyId) {
+        return intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM notes WHERE company_id=" + companyId);
+    }
+
+    public int countFollowRecords(long companyId) {
+        return intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM follow_records WHERE company_id=" + companyId);
+    }
+
+    public int countImportedContacts(long companyId) {
+        return intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM contacts WHERE company_id=" + companyId + " AND imported=1");
+    }
+
+    public int countCompaniesBySpecialFilter(String filter) {
+        return getCompanyIdsByFilter("", "", 0, filter, 1000000).size();
+    }
+
+    public ContactItem getBestContact(long companyId) {
+        Cursor c = getReadableDatabase().rawQuery("SELECT ct.id,ct.company_id,c.name,ct.contact_name,ct.phone,ct.phone_norm,ct.contact_order,ct.star_level,ct.imported,ct.raw_contact_id,ct.imported_at,g.name,c.customer_status,c.seq,c.group_id FROM contacts ct JOIN companies c ON ct.company_id=c.id LEFT JOIN groups_tbl g ON c.group_id=g.id WHERE ct.company_id=? ORDER BY ct.star_level DESC,ct.contact_order LIMIT 1", new String[]{String.valueOf(companyId)});
+        try { return c.moveToFirst() ? contactFromCursor(c) : null; } finally { c.close(); }
+    }
+
+    public FollowSummary getFollowSummary(long companyId) {
+        FollowSummary fs = new FollowSummary();
+        Cursor c = getReadableDatabase().rawQuery("SELECT follow_time,next_follow_date,content FROM follow_records WHERE company_id=? ORDER BY COALESCE(follow_time,created_at) DESC,id DESC LIMIT 1", new String[]{String.valueOf(companyId)});
+        try { if (c.moveToFirst()) { fs.lastFollowTime = c.getString(0); fs.nextFollowDate = c.getString(1); fs.lastContent = c.getString(2); } } finally { c.close(); }
+        Cursor n = getReadableDatabase().rawQuery("SELECT next_follow_date FROM follow_records WHERE company_id=? AND done=0 AND next_follow_date<>'' ORDER BY next_follow_date ASC LIMIT 1", new String[]{String.valueOf(companyId)});
+        try { if (n.moveToFirst()) fs.nextFollowDate = n.getString(0); } finally { n.close(); }
+        fs.followCount = countFollowRecords(companyId);
+        return fs;
+    }
+
+    public CompanyImpact getCompanyImpact(long companyId) {
+        CompanyImpact it = new CompanyImpact();
+        it.contactCount = intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM contacts WHERE company_id=" + companyId);
+        it.noteCount = intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM notes WHERE company_id=" + companyId);
+        it.followCount = intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM follow_records WHERE company_id=" + companyId);
+        it.importedCount = intQuery(getReadableDatabase(), "SELECT COUNT(*) FROM contacts WHERE company_id=" + companyId + " AND imported=1");
+        return it;
+    }
+
+    public void postponeFollow(long followId, int days) {
+        if (days <= 0) days = 1;
+        ContentValues cv = new ContentValues();
+        cv.put("next_follow_date", new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(new Date(System.currentTimeMillis() + days * 24L * 3600L * 1000L)));
+        cv.put("done", 0);
+        getWritableDatabase().update("follow_records", cv, "id=?", new String[]{String.valueOf(followId)});
+        logOperation("跟进延期", "延期" + days + "天", "跟进记录ID=" + followId);
+        rebuildStatsCache(getWritableDatabase());
+    }
+
+    public List<FollowTaskItem> getAllPendingFollowTasks(int limit) {
+        ArrayList<FollowTaskItem> list = new ArrayList<>();
+        String sql = "SELECT fr.id,fr.company_id,c.name,c.customer_status,fr.follow_method,fr.content,fr.next_follow_date,fr.created_at FROM follow_records fr JOIN companies c ON fr.company_id=c.id WHERE fr.done=0 ORDER BY CASE WHEN fr.next_follow_date='' OR fr.next_follow_date IS NULL THEN 1 ELSE 0 END, fr.next_follow_date ASC, fr.id DESC LIMIT ?";
+        Cursor c = getReadableDatabase().rawQuery(sql, new String[]{String.valueOf(limit <= 0 ? 200 : limit)});
+        try { while (c.moveToNext()) { FollowTaskItem it = new FollowTaskItem(); int i=0; it.followId=c.getLong(i++); it.companyId=c.getLong(i++); it.companyName=c.getString(i++); it.customerStatus=c.getString(i++); it.followMethod=c.getString(i++); it.content=c.getString(i++); it.nextFollowDate=c.getString(i++); it.createdAt=c.getString(i++); list.add(it); } } finally { c.close(); }
+        return list;
+    }
+
+    public List<CompanyItem> getCompaniesPage(String query, String status, long groupId, String specialFilter, int limit, int offset) {
+        ArrayList<CompanyItem> base = new ArrayList<>(getCompaniesPage(query, status, groupId, Math.max(limit * 3, limit + 100), offset));
+        if (empty(specialFilter)) return base.size() > limit ? new ArrayList<>(base.subList(0, limit)) : base;
+        ArrayList<CompanyItem> out = new ArrayList<>();
+        for (CompanyItem c : base) {
+            boolean ok = true;
+            if ("unimported".equals(specialFilter)) ok = c.contactCount > c.importedContactCount;
+            else if ("no_phone".equals(specialFilter)) ok = c.contactCount == 0;
+            else if ("has_phone".equals(specialFilter)) ok = c.contactCount > 0;
+            else if ("has_note".equals(specialFilter)) ok = c.noteCount > 0;
+            else if ("recent".equals(specialFilter)) ok = !empty(c.updatedAt);
+            if (ok) out.add(c);
+            if (out.size() >= limit) break;
+        }
+        return out;
+    }
+
+    public List<Long> getCompanyIdsByFilter(String query, String status, long groupId, String specialFilter, int max) {
+        ArrayList<Long> ids = new ArrayList<>();
+        List<CompanyItem> list = getCompaniesPage(query, status, groupId, specialFilter, max <= 0 ? 5000 : max, 0);
+        for (CompanyItem c : list) ids.add(c.id);
+        return ids;
+    }
+
+    public List<CompanyItem> getIncrementalCompanies(String since) {
+        ArrayList<CompanyItem> list = new ArrayList<>();
+        String sql = "SELECT c.id,c.group_id,g.name,c.seq,c.name,c.industry,c.employee_count,c.region,c.address,c.customer_status,c.tags,c.extra_info,c.created_at,c.updated_at,c.contact_count,c.note_count,c.imported_contact_count FROM companies c LEFT JOIN groups_tbl g ON c.group_id=g.id WHERE c.created_at>? OR c.updated_at>? ORDER BY c.updated_at ASC,c.id ASC";
+        Cursor c = getReadableDatabase().rawQuery(sql, new String[]{nonNull(since), nonNull(since)});
+        try { while (c.moveToNext()) list.add(companyFromCursor(c)); } finally { c.close(); }
+        return list;
+    }
+
+    public List<ContactItem> getContactsSince(String since) {
+        ArrayList<ContactItem> list = new ArrayList<>();
+        String sql = "SELECT ct.id,ct.company_id,c.name,ct.contact_name,ct.phone,ct.phone_norm,ct.contact_order,ct.star_level,ct.imported,ct.raw_contact_id,ct.imported_at,g.name,c.customer_status,c.seq,c.group_id FROM contacts ct JOIN companies c ON ct.company_id=c.id LEFT JOIN groups_tbl g ON c.group_id=g.id WHERE ct.created_at>? ORDER BY ct.created_at ASC,ct.id ASC";
+        Cursor c = getReadableDatabase().rawQuery(sql, new String[]{nonNull(since)});
+        try { while (c.moveToNext()) list.add(contactFromCursor(c)); } finally { c.close(); }
+        return list;
+    }
+
+    public List<NoteItem> getNotesSince(String since) {
+        ArrayList<NoteItem> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT id,company_id,content,created_at FROM notes WHERE created_at>? ORDER BY created_at ASC,id ASC", new String[]{nonNull(since)});
+        try { while (c.moveToNext()) { NoteItem n = new NoteItem(); n.id=c.getLong(0); n.companyId=c.getLong(1); n.content=c.getString(2); n.createdAt=c.getString(3); list.add(n); } } finally { c.close(); }
+        return list;
+    }
+
+    public List<FollowRecordItem> getFollowRecordsSince(String since) {
+        ArrayList<FollowRecordItem> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT id,company_id,follow_time,follow_method,content,next_follow_date,done,created_at FROM follow_records WHERE created_at>? ORDER BY created_at ASC,id ASC", new String[]{nonNull(since)});
+        try { while (c.moveToNext()) list.add(followFromCursor(c)); } finally { c.close(); }
+        return list;
+    }
+
+    public void logBackup(String fileName, String type, String result) {
+        try {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues cv = new ContentValues();
+            cv.put("file_name", nonNull(fileName)); cv.put("type", nonNull(type)); cv.put("result", nonNull(result)); cv.put("created_at", now());
+            cv.put("company_count", intQuery(db, "SELECT COUNT(*) FROM companies"));
+            cv.put("contact_count", intQuery(db, "SELECT COUNT(*) FROM contacts"));
+            cv.put("note_count", intQuery(db, "SELECT COUNT(*) FROM notes"));
+            db.insert("backup_logs", null, cv);
+        } catch (Exception ignored) {}
+    }
+
+    public List<BackupLogItem> getBackupLogs(int limit) {
+        ArrayList<BackupLogItem> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT id,file_name,type,result,created_at,COALESCE(company_count,0),COALESCE(contact_count,0),COALESCE(note_count,0) FROM backup_logs ORDER BY id DESC LIMIT ?", new String[]{String.valueOf(limit <= 0 ? 50 : limit)});
+        try { while (c.moveToNext()) { BackupLogItem it = new BackupLogItem(); int i=0; it.id=c.getLong(i++); it.fileName=c.getString(i++); it.type=c.getString(i++); it.result=c.getString(i++); it.createdAt=c.getString(i++); it.companyCount=c.getInt(i++); it.contactCount=c.getInt(i++); it.noteCount=c.getInt(i++); list.add(it); } } finally { c.close(); }
+        return list;
+    }
+
+    public long findCompanyByName(String name) { return findCompanyId(getReadableDatabase(), name); }
+
+    public long findCompanyByPhone(String phone) {
+        String norm = normalizePhone(phone);
+        if (empty(norm)) return -1;
+        Cursor c = getReadableDatabase().rawQuery("SELECT company_id FROM contacts WHERE phone_norm=? LIMIT 1", new String[]{norm});
+        try { return c.moveToFirst() ? c.getLong(0) : -1; } finally { c.close(); }
+    }
+
+    public static class FollowSummary { public int followCount; public String lastFollowTime, nextFollowDate, lastContent; }
+    public static class CompanyImpact { public int contactCount, noteCount, followCount, importedCount; }
+    public static class BackupLogItem { public long id; public int companyCount, contactCount, noteCount; public String fileName, type, result, createdAt; }
+
+
     public static class GroupItem { public long id; public String name; public GroupItem(long i,String n){id=i;name=n;} public String toString(){return name;} }
     public static class Stats { public int companyCount, contactCount, importedCount, statusNone, focusCount, followCount, importantCount, exceptionCount, todayFollowCount, overdueFollowCount, soonFollowCount, callPendingCount; }
-    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newTags, skippedNoCompany, duplicateRows, abnormalRows, statusUpgradeCount, statusKeepCount, newPhoneCount, duplicatePhoneCount, phoneAbnormalCount; }
+    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newFollows, newTags, skippedNoCompany, duplicateRows, abnormalRows, statusUpgradeCount, statusKeepCount, newPhoneCount, duplicatePhoneCount, phoneAbnormalCount; }
     public static class ImportPreviewResult extends ImportResult { }
 
     public static class CompanyItem {
