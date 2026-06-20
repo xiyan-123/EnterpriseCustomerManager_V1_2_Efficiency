@@ -637,32 +637,19 @@ public class MainActivity extends Activity {
     }
 
     private void showImportPreviewDialog(CustomerDbHelper.ImportPreviewResult r) {
-        String msg = "本次 Excel 预览结果：
-
-" +
-                "识别企业：" + (r.newCompanies + r.mergedCompanies) + " 家
-" +
-                "新企业：" + r.newCompanies + " 家
-" +
-                "已存在企业：" + r.mergedCompanies + " 家
-" +
-                "预计新增电话：" + r.newPhoneCount + " 个
-" +
-                "预计重复电话：" + r.duplicatePhoneCount + " 个
-" +
-                "预计新增备注：" + r.newNotes + " 条
-" +
-                "客户状态将提升：" + r.statusUpgradeCount + " 家
-" +
-                "客户状态保持不变：" + r.statusKeepCount + " 家
-" +
-                "异常行/提示：" + r.abnormalRows + " 行
-" +
-                "空公司名称行：" + r.skippedNoCompany + " 行
-" +
-                "电话格式异常：" + r.phoneAbnormalCount + " 个
-
-确认后才会正式写入数据库。";
+        String msg = "本次 Excel 预览结果：\n\n" +
+                "识别企业：" + (r.newCompanies + r.mergedCompanies) + " 家\n" +
+                "新企业：" + r.newCompanies + " 家\n" +
+                "已存在企业：" + r.mergedCompanies + " 家\n" +
+                "预计新增电话：" + r.newPhoneCount + " 个\n" +
+                "预计重复电话：" + r.duplicatePhoneCount + " 个\n" +
+                "预计新增备注：" + r.newNotes + " 条\n" +
+                "客户状态将提升：" + r.statusUpgradeCount + " 家\n" +
+                "客户状态保持不变：" + r.statusKeepCount + " 家\n" +
+                "异常行/提示：" + r.abnormalRows + " 行\n" +
+                "空公司名称行：" + r.skippedNoCompany + " 行\n" +
+                "电话格式异常：" + r.phoneAbnormalCount + " 个\n\n" +
+                "确认后才会正式写入数据库。";
         new AlertDialog.Builder(this)
                 .setTitle("导入前预览")
                 .setMessage(msg)
@@ -687,15 +674,15 @@ public class MainActivity extends Activity {
                     pd.dismiss();
                     new AlertDialog.Builder(this)
                             .setTitle("导入完成")
-                            .setMessage("新增企业：" + r.newCompanies + "
-合并企业：" + r.mergedCompanies + "
-新增联系人：" + r.newContacts + "
-新增备注：" + r.newNotes + "
-新增标签：" + r.newTags + "
-状态提升：" + r.statusUpgradeCount + "
-状态保持：" + r.statusKeepCount + "
-重复行提示：" + r.duplicateRows + "
-跳过无公司名称行：" + r.skippedNoCompany)
+                            .setMessage("新增企业：" + r.newCompanies + "\n" +
+                                    "合并企业：" + r.mergedCompanies + "\n" +
+                                    "新增联系人：" + r.newContacts + "\n" +
+                                    "新增备注：" + r.newNotes + "\n" +
+                                    "新增标签：" + r.newTags + "\n" +
+                                    "状态提升：" + r.statusUpgradeCount + "\n" +
+                                    "状态保持：" + r.statusKeepCount + "\n" +
+                                    "重复行提示：" + r.duplicateRows + "\n" +
+                                    "跳过无公司名称行：" + r.skippedNoCompany)
                             .setPositiveButton("确定", (d,w)->{ customerVisibleLimit = PAGE_SIZE; render(); })
                             .show();
                 });
