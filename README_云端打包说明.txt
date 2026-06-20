@@ -1,13 +1,19 @@
-不用 Android Studio 的打包方式：
+GitHub Actions 云端打包说明
 
-1. 新建 GitHub 仓库。
-2. 解压本压缩包。
-3. 把 EnterpriseCustomerManager 文件夹内的 app、.github、build.gradle、settings.gradle 等文件上传到仓库根目录。
-4. 打开仓库 Actions 页面。
-5. 左侧选择 Build Android APK。
-6. 点击 Run workflow。
-7. 等待绿色对勾。
-8. 在运行详情页底部 Artifacts 下载 enterprise-customer-manager-debug-apk。
-9. 解压后得到 app-debug.apk，发送到手机安装。
+1. 解压 EnterpriseCustomerManager_V1_3_FullEnhanced.zip。
+2. 上传 EnterpriseCustomerManager 文件夹内的内容到 GitHub 仓库根目录：
+   app
+   .github
+   build.gradle
+   settings.gradle
+   README_功能说明.txt
+   README_云端打包说明.txt
+3. 进入仓库顶部 Actions。
+4. 选择 Build Android APK。
+5. 点击 Run workflow。
+6. 等待绿色对勾。
+7. 下载 Artifacts 中的 enterprise-customer-manager-debug-apk。
+8. 解压后得到 app-debug.apk。
+9. 手机安装时请选择覆盖安装，不要先卸载旧版。
 
-如果安装新版提示“应用未安装”，请先卸载旧版本，再安装新版。卸载App会清空App内部数据，但不会删除已写入手机通讯录的联系人。
+如果 GitHub 没有出现 Build Android APK，说明 .github/workflows/build-apk.yml 没有上传成功，需要手动补该文件。

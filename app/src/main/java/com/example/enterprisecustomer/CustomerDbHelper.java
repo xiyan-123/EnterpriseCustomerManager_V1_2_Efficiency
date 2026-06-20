@@ -16,15 +16,17 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.HashSet;
 
 public class CustomerDbHelper extends SQLiteOpenHelper {
     public static final String DB_NAME = "enterprise_customer_manager.db";
-    public static final int DB_VERSION = 3;
+    public static final int DB_VERSION = 5;
 
     public static final String STATUS_NONE = "未设置";
     public static final String STATUS_FOCUS = "关注";
     public static final String STATUS_FOLLOW = "跟进";
-    public static final String STATUS_IMPORTANT = "重点";
+    public static final String STATUS_IMPORTANT = "潜力";
+    public static final String STATUS_OLD_IMPORTANT = "重点";
 
     public CustomerDbHelper(Context context) {
         super(context, DB_NAME, null, DB_VERSION);
@@ -96,6 +98,13 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         if (oldVersion < 3) {
             tryExec(db, "ALTER TABLE contacts ADD COLUMN star_level INTEGER NOT NULL DEFAULT 0");
         }
+        if (oldVersion < 4) {
+            tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
+        }
+        if (oldVersion < 5) {
+            // V1.3：只新增表和索引，不删除原有企业、联系人、备注、分组数据。
+            tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
+        }
         createIndexesAndMaintenanceTables(db);
         rebuildAllCaches(db);
     }
@@ -128,6 +137,12 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         tryExec(db, "CREATE INDEX IF NOT EXISTS idx_call_records_status ON call_records(status)");
         tryExec(db, "CREATE TABLE IF NOT EXISTS operation_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, title TEXT, detail TEXT, created_at TEXT)");
         tryExec(db, "CREATE INDEX IF NOT EXISTS idx_operation_logs_type ON operation_logs(type)");
+        tryExec(db, "CREATE TABLE IF NOT EXISTS follow_records (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, follow_time TEXT, follow_method TEXT, content TEXT, next_follow_date TEXT, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)");
+        tryExec(db, "CREATE INDEX IF NOT EXISTS idx_follow_company ON follow_records(company_id, id)");
+        tryExec(db, "CREATE INDEX IF NOT EXISTS idx_follow_next ON follow_records(next_follow_date, done)");
+        tryExec(db, "CREATE TABLE IF NOT EXISTS duplicate_ignores (key TEXT PRIMARY KEY, created_at TEXT)");
+        tryExec(db, "CREATE TABLE IF NOT EXISTS backup_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, file_name TEXT, type TEXT, result TEXT, created_at TEXT)");
+        tryExec(db, "UPDATE companies SET customer_status='潜力' WHERE customer_status='重点'");
     }
 
     public static String now() {
@@ -154,6 +169,40 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
 
     public static String nonNull(String s) { return s == null ? "" : s; }
     public static boolean empty(String s) { return s == null || s.trim().isEmpty(); }
+
+    public static String normalizeStatus(String s) {
+        if (empty(s)) return "";
+        String t = s.trim();
+        if (STATUS_NONE.equals(t)) return "";
+        if (STATUS_FOCUS.equals(t)) return STATUS_FOCUS;
+        if (STATUS_FOLLOW.equals(t)) return STATUS_FOLLOW;
+        if (STATUS_IMPORTANT.equals(t) || STATUS_OLD_IMPORTANT.equals(t) || "重要".equals(t) || "高潜".equals(t)) return STATUS_IMPORTANT;
+        return "";
+    }
+
+    private static int statusRank(String status) {
+        String s = normalizeStatus(status);
+        if (STATUS_IMPORTANT.equals(s)) return 3;
+        if (STATUS_FOLLOW.equals(s)) return 2;
+        if (STATUS_FOCUS.equals(s)) return 1;
+        return 0;
+    }
+
+    private boolean applyStatusIfHigher(SQLiteDatabase db, long companyId, String incomingStatus) {
+        String status = normalizeStatus(incomingStatus);
+        if (empty(status)) return false;
+        String old = "";
+        Cursor c = db.rawQuery("SELECT customer_status FROM companies WHERE id=?", new String[]{String.valueOf(companyId)});
+        try { if (c.moveToFirst()) old = c.getString(0); } finally { c.close(); }
+        if (statusRank(status) > statusRank(old)) {
+            ContentValues cv = new ContentValues();
+            cv.put("customer_status", status);
+            cv.put("updated_at", now());
+            db.update("companies", cv, "id=?", new String[]{String.valueOf(companyId)});
+            return true;
+        }
+        return false;
+    }
 
     public long ensureGroup(String name) {
         if (empty(name)) name = "默认分组";
@@ -273,7 +322,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
                 int i=0;
                 it.id=c.getLong(i++); it.groupId=c.getLong(i++); it.groupName=c.getString(i++); it.seq=c.getInt(i++); it.name=c.getString(i++);
                 it.industry=c.getString(i++); it.employeeCount=c.getString(i++); it.region=c.getString(i++); it.address=c.getString(i++);
-                it.customerStatus=c.getString(i++); it.tags=c.getString(i++); it.extraInfo=c.getString(i++); it.createdAt=c.getString(i++); it.updatedAt=c.getString(i++);
+                it.customerStatus=normalizeStatus(c.getString(i++)); it.tags=c.getString(i++); it.extraInfo=c.getString(i++); it.createdAt=c.getString(i++); it.updatedAt=c.getString(i++);
             }
         } finally { c.close(); }
         return it;
@@ -294,8 +343,13 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         putStat(db, "status_none", intQuery(db, "SELECT COUNT(*) FROM companies WHERE customer_status IS NULL OR customer_status='' "));
         putStat(db, "focus_count", intQuery(db, "SELECT COUNT(*) FROM companies WHERE customer_status='关注'"));
         putStat(db, "follow_count", intQuery(db, "SELECT COUNT(*) FROM companies WHERE customer_status='跟进'"));
-        putStat(db, "important_count", intQuery(db, "SELECT COUNT(*) FROM companies WHERE customer_status='重点'"));
+        putStat(db, "important_count", intQuery(db, "SELECT COUNT(*) FROM companies WHERE customer_status='潜力' OR customer_status='重点'"));
         putStat(db, "exception_count", intQuery(db, "SELECT COUNT(*) FROM exception_records"));
+        String today = new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(new Date());
+        putStat(db, "today_follow_count", intQuery(db, "SELECT COUNT(DISTINCT company_id) FROM follow_records WHERE done=0 AND next_follow_date='" + today + "'"));
+        putStat(db, "overdue_follow_count", intQuery(db, "SELECT COUNT(DISTINCT company_id) FROM follow_records WHERE done=0 AND next_follow_date<>'' AND next_follow_date<'" + today + "'"));
+        putStat(db, "soon_follow_count", intQuery(db, "SELECT COUNT(DISTINCT company_id) FROM follow_records WHERE done=0 AND next_follow_date>'" + today + "' AND next_follow_date<=date('" + today + "','+7 day')"));
+        putStat(db, "call_pending_count", intQuery(db, "SELECT COUNT(*) FROM call_records WHERE status='未处理' OR status='已匹配'"));
     }
 
     private void putStat(SQLiteDatabase db, String key, int value) {
@@ -345,11 +399,75 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         } finally { c.close(); db.endTransaction(); }
     }
 
+    public ImportPreviewResult previewImportRows(List<Map<String, String>> rows, long fallbackGroupId, boolean preferExcelGroup, String fileName, String defaultStatus) {
+        ImportPreviewResult r = new ImportPreviewResult();
+        SQLiteDatabase db = getReadableDatabase();
+        Map<String, Long> existingCompanies = new HashMap<>();
+        Cursor ec = db.rawQuery("SELECT normalized_name,id FROM companies", null);
+        try { while (ec.moveToNext()) existingCompanies.put(ec.getString(0), ec.getLong(1)); } finally { ec.close(); }
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        if (rows == null) return r;
+        int rowNo = 1;
+        for (Map<String, String> row : rows) {
+            rowNo++;
+            String companyName = first(row, "公司名称", "企业名称", "单位名称", "客户名称", "公司", "企业", "名称");
+            if (empty(companyName)) { r.skippedNoCompany++; r.abnormalRows++; continue; }
+            String norm = normalizeCompany(companyName);
+            if (empty(norm)) { r.skippedNoCompany++; r.abnormalRows++; continue; }
+            if (!seen.add(norm)) r.duplicateRows++;
+            String rowStatus = first(row, "客户状态", "状态", "客户等级", "跟进状态");
+            String importStatus = empty(rowStatus) ? normalizeStatus(defaultStatus) : normalizeStatus(rowStatus);
+            Long existed = existingCompanies.get(norm);
+            long companyId = existed == null ? -1 : existed;
+            if (companyId <= 0) r.newCompanies++; else r.mergedCompanies++;
+            if (!empty(importStatus)) {
+                if (companyId <= 0) r.statusUpgradeCount++;
+                else {
+                    CompanyItem old = getCompanyLight(db, companyId);
+                    if (statusRank(importStatus) > statusRank(old.customerStatus)) r.statusUpgradeCount++;
+                    else r.statusKeepCount++;
+                }
+            }
+            for (int i=1;i<=80;i++) {
+                String phone = first(row, "电话号码"+i, "手机号"+i, "联系电话"+i, "电话"+i, "手机"+i);
+                if (!empty(phone)) {
+                    String pn = normalizePhone(phone);
+                    if (empty(pn) || pn.length() < 5) { r.phoneAbnormalCount++; r.abnormalRows++; }
+                    else if (companyId > 0 && contactExists(db, companyId, pn)) r.duplicatePhoneCount++;
+                    else r.newPhoneCount++;
+                }
+            }
+            String phone = first(row, "电话号码", "手机号", "联系电话", "电话", "手机", "移动电话", "联系方式");
+            if (!empty(phone)) {
+                String pn = normalizePhone(phone);
+                if (empty(pn) || pn.length() < 5) { r.phoneAbnormalCount++; r.abnormalRows++; }
+                else if (companyId > 0 && contactExists(db, companyId, pn)) r.duplicatePhoneCount++;
+                else r.newPhoneCount++;
+            }
+            for (int i=1;i<=100;i++) {
+                String note = first(row, "备注"+i, "备注信息"+i, "跟进记录"+i, "记录"+i);
+                if (!empty(note)) r.newNotes++;
+            }
+            String note = first(row, "备注", "备注信息", "说明");
+            if (!empty(note)) r.newNotes++;
+        }
+        return r;
+    }
+
+    private boolean contactExists(SQLiteDatabase db, long companyId, String phoneNorm) {
+        Cursor c = db.rawQuery("SELECT id FROM contacts WHERE company_id=? AND phone_norm=?", new String[]{String.valueOf(companyId), phoneNorm});
+        try { return c.moveToFirst(); } finally { c.close(); }
+    }
+
     public ImportResult importRows(List<Map<String, String>> rows, long fallbackGroupId, boolean preferExcelGroup) {
-        return importRows(rows, fallbackGroupId, preferExcelGroup, "Excel导入");
+        return importRows(rows, fallbackGroupId, preferExcelGroup, "Excel导入", "");
     }
 
     public ImportResult importRows(List<Map<String, String>> rows, long fallbackGroupId, boolean preferExcelGroup, String fileName) {
+        return importRows(rows, fallbackGroupId, preferExcelGroup, fileName, "");
+    }
+
+    public ImportResult importRows(List<Map<String, String>> rows, long fallbackGroupId, boolean preferExcelGroup, String fileName, String defaultStatus) {
         ImportResult result = new ImportResult();
         SQLiteDatabase db = getWritableDatabase();
         db.beginTransaction();
@@ -378,15 +496,20 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
                     if (empty(groupName)) groupId = fallbackGroupId;
                     else if (groupCache.containsKey(groupName.trim())) groupId = groupCache.get(groupName.trim());
                     else { groupId = ensureGroup(groupName); groupCache.put(groupName.trim(), groupId); }
+                    String rowStatus = first(row, "客户状态", "状态", "客户等级", "跟进状态");
+                    String importStatus = empty(rowStatus) ? normalizeStatus(defaultStatus) : normalizeStatus(rowStatus);
                     Long cid = existingCompanies.get(norm);
                     long companyId;
                     if (cid == null || cid <= 0) {
-                        companyId = insertCompany(db, row, companyName, groupId);
+                        companyId = insertCompany(db, row, companyName, groupId, importStatus);
                         existingCompanies.put(norm, companyId);
                         result.newCompanies++;
+                        if (!empty(importStatus)) result.statusUpgradeCount++;
                     } else {
                         companyId = cid;
                         supplementCompany(db, companyId, row);
+                        if (applyStatusIfHigher(db, companyId, importStatus)) result.statusUpgradeCount++;
+                        else if (!empty(importStatus)) result.statusKeepCount++;
                         result.mergedCompanies++;
                     }
                     int contacts = importContactsForCompany(db, companyId, row);
@@ -418,7 +541,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         try { return c.moveToFirst() ? c.getLong(0) : -1; } finally { c.close(); }
     }
 
-    private long insertCompany(SQLiteDatabase db, Map<String, String> row, String name, long groupId) {
+    private long insertCompany(SQLiteDatabase db, Map<String, String> row, String name, long groupId, String importStatus) {
         ContentValues cv = new ContentValues();
         cv.put("group_id", groupId);
         cv.put("seq", nextSeq(db, groupId));
@@ -428,7 +551,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         cv.put("employee_count", first(row, "参保人数", "人数", "员工人数"));
         cv.put("region", first(row, "区域", "地区", "所在区域"));
         cv.put("address", first(row, "地址", "企业地址", "注册地址", "经营地址"));
-        cv.put("customer_status", ""); // 状态必须手动设置，Excel 中的客户状态不导入
+        cv.put("customer_status", normalizeStatus(importStatus));
         cv.put("tags", collectTagValues(row));
         cv.put("extra_info", collectExtraValues(row));
         cv.put("created_at", now());
@@ -583,7 +706,6 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
             String v = row.get(key);
             if (empty(v)) continue;
             if (isStandardHeader(k)) continue;
-            if (k.equals("客户状态")) continue; // 客户状态不从 Excel 导入
             extra.add(k + ":" + v.trim());
         }
         return join(extra);
@@ -601,6 +723,8 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         if (h.matches("电话号码\\d*|手机号\\d*|联系电话\\d*|电话\\d*|手机\\d*|移动电话|联系方式")) return true;
         if (h.matches("备注\\d*|备注信息\\d*|跟进记录\\d*|记录\\d*|说明")) return true;
         if (h.matches("标签\\d*|客户标签")) return true;
+        if (h.matches("星级\\d*|号码星级\\d*|重要程度\\d*")) return true;
+        if (h.equals("客户状态") || h.equals("状态") || h.equals("客户等级") || h.equals("跟进状态")) return true;
         return h.equals("序号") || h.equals("分组") || h.equals("客户分组") || h.equals("组别") ||
                 h.equals("公司名称") || h.equals("企业名称") || h.equals("单位名称") || h.equals("客户名称") || h.equals("公司") || h.equals("企业") || h.equals("名称") ||
                 h.equals("所属行业") || h.equals("行业") || h.equals("经营行业") ||
@@ -639,6 +763,10 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         s.followCount = Math.max(0, getCachedStat(db, "follow_count"));
         s.importantCount = Math.max(0, getCachedStat(db, "important_count"));
         s.exceptionCount = Math.max(0, getCachedStat(db, "exception_count"));
+        s.todayFollowCount = Math.max(0, getCachedStat(db, "today_follow_count"));
+        s.overdueFollowCount = Math.max(0, getCachedStat(db, "overdue_follow_count"));
+        s.soonFollowCount = Math.max(0, getCachedStat(db, "soon_follow_count"));
+        s.callPendingCount = Math.max(0, getCachedStat(db, "call_pending_count"));
         return s;
     }
 
@@ -661,6 +789,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         if (groupId > 0) { sql.append("AND c.group_id=? "); args.add(String.valueOf(groupId)); }
         if (!empty(status)) {
             if (STATUS_NONE.equals(status)) sql.append("AND (c.customer_status IS NULL OR c.customer_status='') ");
+            else if (STATUS_IMPORTANT.equals(status)) { sql.append("AND (c.customer_status=? OR c.customer_status=?) "); args.add(STATUS_IMPORTANT); args.add(STATUS_OLD_IMPORTANT); }
             else { sql.append("AND c.customer_status=? "); args.add(status); }
         }
         if (!empty(query)) {
@@ -692,7 +821,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         it.employeeCount = c.getString(i++);
         it.region = c.getString(i++);
         it.address = c.getString(i++);
-        it.customerStatus = c.getString(i++);
+        it.customerStatus = normalizeStatus(c.getString(i++));
         it.tags = c.getString(i++);
         it.extraInfo = c.getString(i++);
         it.createdAt = c.getString(i++);
@@ -746,7 +875,7 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
     public void setCompanyStatus(long id, String status) {
-        if (STATUS_NONE.equals(status)) status = "";
+        status = normalizeStatus(status);
         ContentValues cv = new ContentValues();
         cv.put("customer_status", nonNull(status));
         cv.put("updated_at", now());
@@ -951,7 +1080,10 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
         String sql = "SELECT ct.id,ct.company_id,c.name,ct.contact_name,ct.phone,ct.phone_norm,ct.contact_order,ct.star_level,ct.imported,ct.raw_contact_id,ct.imported_at,g.name,c.customer_status,c.seq,c.group_id " +
                 "FROM contacts ct JOIN companies c ON ct.company_id=c.id LEFT JOIN groups_tbl g ON c.group_id=g.id WHERE ct.imported=0 ";
         ArrayList<String> args = new ArrayList<>();
-        if (!empty(status)) { sql += "AND c.customer_status=? "; args.add(status); }
+        if (!empty(status)) {
+            if (STATUS_IMPORTANT.equals(status)) { sql += "AND (c.customer_status=? OR c.customer_status=?) "; args.add(STATUS_IMPORTANT); args.add(STATUS_OLD_IMPORTANT); }
+            else { sql += "AND c.customer_status=? "; args.add(status); }
+        }
         sql += "ORDER BY g.id,c.seq,ct.star_level DESC,ct.contact_order";
         Cursor c = getReadableDatabase().rawQuery(sql, args.toArray(new String[0]));
         try { while (c.moveToNext()) list.add(contactFromCursor(c)); } finally { c.close(); }
@@ -1095,6 +1227,171 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
 
+    public List<FollowRecordItem> getFollowRecords(long companyId) {
+        ArrayList<FollowRecordItem> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT id,company_id,follow_time,follow_method,content,next_follow_date,done,created_at FROM follow_records WHERE company_id=? ORDER BY COALESCE(follow_time,created_at) DESC,id DESC", new String[]{String.valueOf(companyId)});
+        try { while (c.moveToNext()) list.add(followFromCursor(c)); } finally { c.close(); }
+        return list;
+    }
+
+    private FollowRecordItem followFromCursor(Cursor c) {
+        FollowRecordItem it = new FollowRecordItem(); int i=0;
+        it.id=c.getLong(i++); it.companyId=c.getLong(i++); it.followTime=c.getString(i++); it.followMethod=c.getString(i++); it.content=c.getString(i++); it.nextFollowDate=c.getString(i++); it.done=c.getInt(i++)==1; it.createdAt=c.getString(i++);
+        return it;
+    }
+
+    public long addFollowRecord(long companyId, String method, String content, String nextDate) {
+        ContentValues cv = new ContentValues();
+        cv.put("company_id", companyId); cv.put("follow_time", now()); cv.put("follow_method", nonNull(method)); cv.put("content", nonNull(content)); cv.put("next_follow_date", nonNull(nextDate).trim()); cv.put("done", 0); cv.put("created_at", now());
+        long id = getWritableDatabase().insert("follow_records", null, cv);
+        logOperation("跟进记录", "新增跟进记录", "企业ID=" + companyId + " 下次跟进=" + nonNull(nextDate));
+        rebuildStatsCache(getWritableDatabase());
+        return id;
+    }
+
+    public void deleteFollowRecord(long id) {
+        getWritableDatabase().delete("follow_records", "id=?", new String[]{String.valueOf(id)});
+        logOperation("跟进记录", "删除跟进记录", "记录ID=" + id);
+        rebuildStatsCache(getWritableDatabase());
+    }
+
+    public void markFollowDone(long id, boolean done) {
+        ContentValues cv = new ContentValues(); cv.put("done", done ? 1 : 0);
+        getWritableDatabase().update("follow_records", cv, "id=?", new String[]{String.valueOf(id)});
+        rebuildStatsCache(getWritableDatabase());
+    }
+
+    public List<FollowTaskItem> getFollowTasks(String mode, int limit) {
+        ArrayList<FollowTaskItem> list = new ArrayList<>();
+        String today = new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(new Date());
+        String where;
+        if ("today".equals(mode)) where = "fr.done=0 AND fr.next_follow_date='" + today + "'";
+        else if ("overdue".equals(mode)) where = "fr.done=0 AND fr.next_follow_date<>'' AND fr.next_follow_date<'" + today + "'";
+        else where = "fr.done=0 AND fr.next_follow_date>'" + today + "' AND fr.next_follow_date<=date('" + today + "','+7 day')";
+        String sql = "SELECT fr.id,fr.company_id,c.name,c.customer_status,fr.follow_method,fr.content,fr.next_follow_date,fr.created_at FROM follow_records fr JOIN companies c ON fr.company_id=c.id WHERE " + where + " ORDER BY fr.next_follow_date ASC,fr.id DESC LIMIT ?";
+        Cursor c = getReadableDatabase().rawQuery(sql, new String[]{String.valueOf(limit <= 0 ? 100 : limit)});
+        try { while (c.moveToNext()) { FollowTaskItem it = new FollowTaskItem(); int i=0; it.followId=c.getLong(i++); it.companyId=c.getLong(i++); it.companyName=c.getString(i++); it.customerStatus=c.getString(i++); it.followMethod=c.getString(i++); it.content=c.getString(i++); it.nextFollowDate=c.getString(i++); it.createdAt=c.getString(i++); list.add(it); } } finally { c.close(); }
+        return list;
+    }
+
+    public List<CompanyItem> getPotentialCompanies(int limit) {
+        ArrayList<CompanyItem> list = new ArrayList<>();
+        String sql = "SELECT c.id,c.group_id,g.name,c.seq,c.name,c.industry,c.employee_count,c.region,c.address,c.customer_status,c.tags,c.extra_info,c.created_at,c.updated_at,c.contact_count,c.note_count,c.imported_contact_count " +
+                "FROM companies c LEFT JOIN groups_tbl g ON c.group_id=g.id LEFT JOIN (SELECT company_id,MAX(star_level) ms FROM contacts GROUP BY company_id) st ON st.company_id=c.id LEFT JOIN (SELECT company_id,MIN(next_follow_date) nf FROM follow_records WHERE done=0 AND next_follow_date<>'' GROUP BY company_id) fr ON fr.company_id=c.id " +
+                "WHERE c.customer_status='潜力' OR c.customer_status='重点' ORDER BY COALESCE(st.ms,0) DESC, CASE WHEN fr.nf IS NULL THEN 1 ELSE 0 END, fr.nf ASC, c.updated_at DESC LIMIT ?";
+        Cursor c = getReadableDatabase().rawQuery(sql, new String[]{String.valueOf(limit <= 0 ? 150 : limit)});
+        try { while (c.moveToNext()) list.add(companyFromCursor(c)); } finally { c.close(); }
+        return list;
+    }
+
+    public List<DuplicateItem> findDuplicateSuspects(int limit) {
+        ArrayList<DuplicateItem> list = new ArrayList<>();
+        HashSet<String> added = new HashSet<>();
+        Cursor p = getReadableDatabase().rawQuery("SELECT a.company_id,b.company_id,a.phone_norm FROM contacts a JOIN contacts b ON a.phone_norm=b.phone_norm AND a.company_id<b.company_id WHERE a.phone_norm<>'' GROUP BY a.company_id,b.company_id LIMIT ?", new String[]{String.valueOf(limit <= 0 ? 80 : limit)});
+        try { while (p.moveToNext()) addDuplicate(list, added, p.getLong(0), p.getLong(1), "相同电话：" + p.getString(2)); } finally { p.close(); }
+        ArrayList<CompanyItem> cs = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT id,group_id,0,seq,name,industry,employee_count,region,address,customer_status,tags,extra_info,created_at,updated_at,contact_count,note_count,tag_count,imported_contact_count FROM companies ORDER BY id DESC LIMIT 800", null);
+        try { while (c.moveToNext()) { CompanyItem it = new CompanyItem(); int i=0; it.id=c.getLong(i++); it.groupId=c.getLong(i++); i++; it.seq=c.getInt(i++); it.name=c.getString(i++); it.industry=c.getString(i++); it.employeeCount=c.getString(i++); it.region=c.getString(i++); it.address=c.getString(i++); it.customerStatus=c.getString(i++); it.tags=c.getString(i++); it.extraInfo=c.getString(i++); it.createdAt=c.getString(i++); it.updatedAt=c.getString(i++); it.contactCount=c.getInt(i++); it.noteCount=c.getInt(i++); i++; it.importedContactCount=c.getInt(i++); cs.add(it); } } finally { c.close(); }
+        for (int i=0;i<cs.size() && list.size() < (limit<=0?80:limit);i++) {
+            String ai = simpleCompanyName(cs.get(i).name);
+            if (ai.length() < 4) continue;
+            for (int j=i+1;j<cs.size() && list.size() < (limit<=0?80:limit);j++) {
+                String bj = simpleCompanyName(cs.get(j).name);
+                if (bj.length() < 4) continue;
+                if (ai.equals(bj) || ai.contains(bj) || bj.contains(ai)) addDuplicate(list, added, cs.get(i).id, cs.get(j).id, "企业名称高度相似");
+            }
+        }
+        return list;
+    }
+
+    private void addDuplicate(ArrayList<DuplicateItem> list, HashSet<String> added, long a, long b, String reason) {
+        if (a == b) return;
+        long x = Math.min(a,b), y = Math.max(a,b);
+        String key = x + "_" + y;
+        if (added.contains(key)) return;
+        Cursor ig = getReadableDatabase().rawQuery("SELECT key FROM duplicate_ignores WHERE key=?", new String[]{key});
+        try { if (ig.moveToFirst()) return; } finally { ig.close(); }
+        CompanyItem ca = getCompany(x), cb = getCompany(y);
+        DuplicateItem it = new DuplicateItem(); it.companyAId=x; it.companyBId=y; it.companyAName=ca.name; it.companyBName=cb.name; it.reason=reason; it.key=key; list.add(it); added.add(key);
+    }
+
+    private static String simpleCompanyName(String s) {
+        String t = normalizeCompany(s);
+        String[] words = {"有限责任公司","股份有限公司","有限公司","集团","公司","企业","厂","商行","经营部","上海市","上海","浙江省","浙江","江苏省","江苏"};
+        for (String w : words) t = t.replace(w, "");
+        return t;
+    }
+
+    public void ignoreDuplicate(String key) {
+        ContentValues cv = new ContentValues(); cv.put("key", key); cv.put("created_at", now());
+        getWritableDatabase().insertWithOnConflict("duplicate_ignores", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+
+    public void mergeCompanies(long keepId, long removeId) {
+        if (keepId <= 0 || removeId <= 0 || keepId == removeId) return;
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            CompanyItem keep = getCompany(keepId); CompanyItem rem = getCompany(removeId);
+            String higherStatus = statusRank(rem.customerStatus) > statusRank(keep.customerStatus) ? normalizeStatus(rem.customerStatus) : normalizeStatus(keep.customerStatus);
+            ContentValues ccv = new ContentValues();
+            ccv.put("industry", empty(keep.industry) ? rem.industry : keep.industry);
+            ccv.put("employee_count", empty(keep.employeeCount) ? rem.employeeCount : keep.employeeCount);
+            ccv.put("region", empty(keep.region) ? rem.region : keep.region);
+            ccv.put("address", empty(keep.address) ? rem.address : keep.address);
+            ccv.put("customer_status", higherStatus);
+            ccv.put("tags", mergeSemi(keep.tags, rem.tags));
+            ccv.put("extra_info", mergeSemi(keep.extraInfo, rem.extraInfo));
+            ccv.put("updated_at", now());
+            db.update("companies", ccv, "id=?", new String[]{String.valueOf(keepId)});
+            Cursor ct = db.rawQuery("SELECT contact_name,phone,phone_norm,star_level FROM contacts WHERE company_id=?", new String[]{String.valueOf(removeId)});
+            try { while (ct.moveToNext()) { String name=ct.getString(0), phone=ct.getString(1), norm=ct.getString(2); int star=ct.getInt(3); Cursor ex = db.rawQuery("SELECT id,star_level FROM contacts WHERE company_id=? AND phone_norm=?", new String[]{String.valueOf(keepId), norm}); try { if (ex.moveToFirst()) { if (star > ex.getInt(1)) { ContentValues scv = new ContentValues(); scv.put("star_level", star); db.update("contacts", scv, "id=?", new String[]{String.valueOf(ex.getLong(0))}); } } else addContactIfNew(db, keepId, name, phone, star); } finally { ex.close(); } } } finally { ct.close(); }
+            db.execSQL("UPDATE notes SET company_id=" + keepId + " WHERE company_id=" + removeId);
+            db.execSQL("UPDATE follow_records SET company_id=" + keepId + " WHERE company_id=" + removeId);
+            db.execSQL("UPDATE call_records SET app_company_id=" + keepId + ", app_company_name=(SELECT name FROM companies WHERE id=" + keepId + ") WHERE app_company_id=" + removeId);
+            db.delete("contacts", "company_id=?", new String[]{String.valueOf(removeId)});
+            db.delete("companies", "id=?", new String[]{String.valueOf(removeId)});
+            updateCompanyCache(db, keepId);
+            resequenceGroup(keep.groupId); resequenceGroup(rem.groupId);
+            rebuildStatsCache(db);
+            db.setTransactionSuccessful();
+        } finally { db.endTransaction(); }
+        logOperation("疑似重复", "手动合并企业", "保留ID=" + keepId + " 合并ID=" + removeId);
+    }
+
+    public List<PhoneIssueItem> scanPhoneIssues(int limit) {
+        ArrayList<PhoneIssueItem> list = new ArrayList<>();
+        Cursor c = getReadableDatabase().rawQuery("SELECT ct.id,ct.company_id,c.name,ct.contact_name,ct.phone,ct.phone_norm FROM contacts ct JOIN companies c ON ct.company_id=c.id ORDER BY ct.id DESC LIMIT 5000", null);
+        try { while (c.moveToNext() && list.size() < (limit<=0?200:limit)) { PhoneIssueItem it = new PhoneIssueItem(); it.contactId=c.getLong(0); it.companyId=c.getLong(1); it.companyName=c.getString(2); it.contactName=c.getString(3); it.phone=c.getString(4); it.phoneNorm=c.getString(5); String norm=normalizePhone(it.phone); if (!norm.equals(it.phone) || !norm.equals(it.phoneNorm)) { it.reason="格式可清洗"; it.suggested=norm; list.add(it); } else if (norm.length() < 5 || norm.length() > 13) { it.reason="号码长度异常"; it.suggested=norm; list.add(it); } } } finally { c.close(); }
+        Cursor d = getReadableDatabase().rawQuery("SELECT phone_norm,COUNT(DISTINCT company_id) FROM contacts WHERE phone_norm<>'' GROUP BY phone_norm HAVING COUNT(DISTINCT company_id)>1 LIMIT 80", null);
+        try { while (d.moveToNext() && list.size() < (limit<=0?200:limit)) { PhoneIssueItem it = new PhoneIssueItem(); it.reason="同一号码出现在多个企业"; it.phoneNorm=d.getString(0); it.suggested="涉及企业数：" + d.getInt(1); list.add(it); } } finally { d.close(); }
+        return list;
+    }
+
+    public int cleanPhoneFormats() {
+        int n=0; SQLiteDatabase db = getWritableDatabase();
+        Cursor c = db.rawQuery("SELECT id,phone FROM contacts", null);
+        db.beginTransaction();
+        try { while (c.moveToNext()) { long id=c.getLong(0); String old=c.getString(1); String norm=normalizePhone(old); if (!empty(norm) && !norm.equals(old)) { ContentValues cv=new ContentValues(); cv.put("phone", norm); cv.put("phone_norm", norm); n += db.update("contacts", cv, "id=?", new String[]{String.valueOf(id)}); } } db.setTransactionSuccessful(); } finally { c.close(); db.endTransaction(); }
+        rebuildAllCaches(); logOperation("号码清洗", "统一号码格式", "处理数量=" + n); return n;
+    }
+
+    public GroupStats getGroupStats(long groupId) {
+        GroupStats gs = new GroupStats();
+        SQLiteDatabase db = getReadableDatabase();
+        gs.companyCount = intQuery(db, "SELECT COUNT(*) FROM companies WHERE group_id=" + groupId);
+        gs.contactCount = intQuery(db, "SELECT COUNT(*) FROM contacts ct JOIN companies c ON ct.company_id=c.id WHERE c.group_id=" + groupId);
+        gs.importedCount = intQuery(db, "SELECT COUNT(*) FROM contacts ct JOIN companies c ON ct.company_id=c.id WHERE c.group_id=" + groupId + " AND ct.imported=1");
+        gs.focusCount = intQuery(db, "SELECT COUNT(*) FROM companies WHERE group_id=" + groupId + " AND customer_status='关注'");
+        gs.followCount = intQuery(db, "SELECT COUNT(*) FROM companies WHERE group_id=" + groupId + " AND customer_status='跟进'");
+        gs.importantCount = intQuery(db, "SELECT COUNT(*) FROM companies WHERE group_id=" + groupId + " AND (customer_status='潜力' OR customer_status='重点')");
+        gs.star3Count = intQuery(db, "SELECT COUNT(*) FROM contacts ct JOIN companies c ON ct.company_id=c.id WHERE c.group_id=" + groupId + " AND ct.star_level>=3");
+        gs.star2Count = intQuery(db, "SELECT COUNT(*) FROM contacts ct JOIN companies c ON ct.company_id=c.id WHERE c.group_id=" + groupId + " AND ct.star_level=2");
+        gs.star1Count = intQuery(db, "SELECT COUNT(*) FROM contacts ct JOIN companies c ON ct.company_id=c.id WHERE c.group_id=" + groupId + " AND ct.star_level=1");
+        return gs;
+    }
+
+
     public List<ExceptionItem> getExceptions(int limit) {
         ArrayList<ExceptionItem> list = new ArrayList<>();
         Cursor c = getReadableDatabase().rawQuery("SELECT id,source,row_no,company_name,reason,raw_text,created_at FROM exception_records ORDER BY id DESC LIMIT ?", new String[]{String.valueOf(limit <= 0 ? 100 : limit)});
@@ -1110,13 +1407,14 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
 
 
     public static class GroupItem { public long id; public String name; public GroupItem(long i,String n){id=i;name=n;} public String toString(){return name;} }
-    public static class Stats { public int companyCount, contactCount, importedCount, statusNone, focusCount, followCount, importantCount, exceptionCount; }
-    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newTags, skippedNoCompany, duplicateRows, abnormalRows; }
+    public static class Stats { public int companyCount, contactCount, importedCount, statusNone, focusCount, followCount, importantCount, exceptionCount, todayFollowCount, overdueFollowCount, soonFollowCount, callPendingCount; }
+    public static class ImportResult { public int newCompanies, mergedCompanies, newContacts, newNotes, newTags, skippedNoCompany, duplicateRows, abnormalRows, statusUpgradeCount, statusKeepCount, newPhoneCount, duplicatePhoneCount, phoneAbnormalCount; }
+    public static class ImportPreviewResult extends ImportResult { }
 
     public static class CompanyItem {
         public long id, groupId; public int seq, contactCount, noteCount, importedContactCount;
         public String groupName, name, industry, employeeCount, region, address, customerStatus, tags, extraInfo, createdAt, updatedAt;
-        public String statusText(){ return empty(customerStatus) ? STATUS_NONE : customerStatus; }
+        public String statusText(){ String s = normalizeStatus(customerStatus); return empty(s) ? STATUS_NONE : s; }
         public String importText(){ if (contactCount == 0) return "无联系人"; if (importedContactCount == 0) return "未导入"; if (importedContactCount >= contactCount) return "已导入"; return "部分导入"; }
     }
 
@@ -1132,6 +1430,11 @@ public class CustomerDbHelper extends SQLiteOpenHelper {
     }
 
     public static class NoteItem { public long id, companyId; public String content, createdAt; }
+    public static class FollowRecordItem { public long id, companyId; public boolean done; public String followTime, followMethod, content, nextFollowDate, createdAt; }
+    public static class FollowTaskItem { public long followId, companyId; public String companyName, customerStatus, followMethod, content, nextFollowDate, createdAt; }
+    public static class DuplicateItem { public long companyAId, companyBId; public String companyAName, companyBName, reason, key; }
+    public static class PhoneIssueItem { public long contactId, companyId; public String companyName, contactName, phone, phoneNorm, reason, suggested; }
+    public static class GroupStats { public int companyCount, contactCount, importedCount, focusCount, followCount, importantCount, star1Count, star2Count, star3Count; }
     public static class LogItem { public long id; public int totalRows,newCompanies,mergedCompanies,newContacts,newNotes,newTags,skippedNoCompany,duplicateRows,abnormalRows; public String fileName,startedAt,finishedAt,message; }
     public static class ExceptionItem { public long id; public int rowNo; public String source,companyName,reason,rawText,createdAt; }
     public static class OperationLogItem { public long id; public String type,title,detail,createdAt; }

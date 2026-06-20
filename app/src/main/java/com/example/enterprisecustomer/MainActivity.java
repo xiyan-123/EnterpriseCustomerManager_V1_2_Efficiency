@@ -9,6 +9,7 @@ import android.content.ContentProviderResult;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ClipboardManager;
+import android.content.SharedPreferences;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -35,6 +36,11 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -44,6 +50,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.Calendar;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,6 +59,8 @@ public class MainActivity extends Activity {
     private static final int REQ_EXPORT_XLSX = 1002;
     private static final int REQ_CONTACT_PERM = 2001;
     private static final int REQ_CALL_LOG_PERM = 2002;
+    private static final int REQ_BACKUP_EXPORT = 3001;
+    private static final int REQ_BACKUP_RESTORE = 3002;
 
     private CustomerDbHelper db;
     private LinearLayout root;
@@ -67,12 +76,19 @@ public class MainActivity extends Activity {
     private List<String> pendingExportHeaders;
     private List<List<String>> pendingExportRows;
     private List<CustomerDbHelper.ContactItem> pendingImportContacts;
+    private List<Map<String, String>> pendingImportRows;
+    private Uri pendingImportUri;
+    private long pendingImportGroupId;
+    private boolean pendingImportUseExcelGroup;
+    private String pendingImportDefaultStatus;
+    private String pendingImportFileName;
 
     private final String[] tabs = {"首页", "客户", "通讯录", "导入导出", "我的"};
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        autoBackupBeforeV13Open();
         db = new CustomerDbHelper(this);
         buildRoot();
         render();
@@ -143,7 +159,12 @@ public class MainActivity extends Activity {
         box.addView(grid3);
         grid3.addView(statCard("关注", s.focusCount + "", "客户"), weightLp());
         grid3.addView(statCard("跟进", s.followCount + "", "客户"), weightLp());
-        grid3.addView(statCard("重点", s.importantCount + "", "客户"), weightLp());
+        grid3.addView(statCard("潜力", s.importantCount + "", "客户"), weightLp());
+        LinearLayout grid4 = horizontal(0);
+        box.addView(grid4);
+        grid4.addView(statCard("今日待跟进", s.todayFollowCount + "", "客户"), weightLp());
+        grid4.addView(statCard("逾期未跟进", s.overdueFollowCount + "", "客户"), weightLp());
+        grid4.addView(statCard("未入库号码", s.callPendingCount + "", "条"), weightLp());
 
         box.addView(sectionTitle("快捷操作"));
         LinearLayout ops1 = horizontal(0);
@@ -158,6 +179,14 @@ public class MainActivity extends Activity {
         box.addView(ops3);
         ops3.addView(primaryButton("快速录入", v -> showQuickPasteDialog()), weightLp());
         ops3.addView(primaryButton("通话记录匹配", v -> showCallLogPage()), weightLp());
+        LinearLayout ops4 = horizontal(0);
+        box.addView(ops4);
+        ops4.addView(primaryButton("潜力客户", v -> showPotentialCustomerPage()), weightLp());
+        ops4.addView(primaryButton("今日待跟进", v -> showFollowTaskPage("today")), weightLp());
+        LinearLayout ops5 = horizontal(0);
+        box.addView(ops5);
+        ops5.addView(primaryButton("数据备份", v -> showBackupDialog()), weightLp());
+        ops5.addView(primaryButton("逾期跟进", v -> showFollowTaskPage("overdue")), weightLp());
 
         box.addView(sectionTitle("客户状态入口"));
         LinearLayout status = horizontal(0);
@@ -165,7 +194,7 @@ public class MainActivity extends Activity {
         status.addView(statusButton("未设置", CustomerDbHelper.STATUS_NONE), weightLp());
         status.addView(statusButton("关注", CustomerDbHelper.STATUS_FOCUS), weightLp());
         status.addView(statusButton("跟进", CustomerDbHelper.STATUS_FOLLOW), weightLp());
-        status.addView(statusButton("重点", CustomerDbHelper.STATUS_IMPORTANT), weightLp());
+        status.addView(statusButton("潜力", CustomerDbHelper.STATUS_IMPORTANT), weightLp());
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
     }
 
@@ -220,7 +249,7 @@ public class MainActivity extends Activity {
         bar.addView(chip("未设置", CustomerDbHelper.STATUS_NONE.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_NONE; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("关注", CustomerDbHelper.STATUS_FOCUS.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOCUS; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("跟进", CustomerDbHelper.STATUS_FOLLOW.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_FOLLOW; customerVisibleLimit = PAGE_SIZE; render(); }));
-        bar.addView(chip("重点", CustomerDbHelper.STATUS_IMPORTANT.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_IMPORTANT; customerVisibleLimit = PAGE_SIZE; render(); }));
+        bar.addView(chip("潜力", CustomerDbHelper.STATUS_IMPORTANT.equals(currentStatus), v -> { currentStatus = CustomerDbHelper.STATUS_IMPORTANT; customerVisibleLimit = PAGE_SIZE; render(); }));
         bar.addView(chip("全部分组", currentGroupId == 0, v -> { currentGroupId = 0; customerVisibleLimit = PAGE_SIZE; render(); }));
         for (CustomerDbHelper.GroupItem g : db.getGroups()) {
             bar.addView(chip(g.name, currentGroupId == g.id, v -> { currentGroupId = g.id; customerVisibleLimit = PAGE_SIZE; render(); }));
@@ -268,7 +297,7 @@ public class MainActivity extends Activity {
         stat.addView(smallButton("未设置", v -> { db.setCompanyStatus(c.id, ""); showCompanyDetail(c.id); }), weightLp());
         stat.addView(smallButton("关注", v -> { db.setCompanyStatus(c.id, CustomerDbHelper.STATUS_FOCUS); showCompanyDetail(c.id); }), weightLp());
         stat.addView(smallButton("跟进", v -> { db.setCompanyStatus(c.id, CustomerDbHelper.STATUS_FOLLOW); showCompanyDetail(c.id); }), weightLp());
-        stat.addView(smallButton("重点", v -> { db.setCompanyStatus(c.id, CustomerDbHelper.STATUS_IMPORTANT); showCompanyDetail(c.id); }), weightLp());
+        stat.addView(smallButton("潜力", v -> { db.setCompanyStatus(c.id, CustomerDbHelper.STATUS_IMPORTANT); showCompanyDetail(c.id); }), weightLp());
         box.addView(sectionTitle("联系人"));
         List<CustomerDbHelper.ContactItem> contacts = db.getContacts(c.id, null);
         if (contacts.isEmpty()) box.addView(text("暂无联系人", 14, Color.GRAY, false));
@@ -296,6 +325,22 @@ public class MainActivity extends Activity {
             box.addView(nt);
         }
         box.addView(smallButton("新增备注", v -> showAddNoteDialog(c.id)));
+        box.addView(sectionTitle("跟进记录"));
+        List<CustomerDbHelper.FollowRecordItem> follows = db.getFollowRecords(c.id);
+        if (follows.isEmpty()) box.addView(text("暂无跟进记录", 14, Color.GRAY, false));
+        for (CustomerDbHelper.FollowRecordItem fr : follows) {
+            LinearLayout fi = vertical(dp(3));
+            fi.setPadding(dp(8), dp(6), dp(8), dp(6));
+            fi.setBackground(round(Color.rgb(248, 250, 253), dp(10), Color.rgb(225, 230, 238)));
+            fi.addView(text(fr.followTime + "  " + nvl(fr.followMethod,"其他") + (fr.done ? "  已完成" : ""), 14, Color.rgb(42,58,86), true));
+            fi.addView(text(nvl(fr.content,""), 14, Color.rgb(42,58,86), false));
+            if (!CustomerDbHelper.empty(fr.nextFollowDate)) fi.addView(text("下次跟进：" + fr.nextFollowDate, 13, Color.rgb(170, 94, 20), true));
+            LinearLayout fo = horizontal(0); fi.addView(fo);
+            fo.addView(smallButton(fr.done ? "设为未完成" : "完成", v -> { db.markFollowDone(fr.id, !fr.done); showCompanyDetail(c.id); }), weightLp());
+            fo.addView(smallButton("删除", v -> confirm("删除跟进记录", "确认删除这条跟进记录？", () -> { db.deleteFollowRecord(fr.id); showCompanyDetail(c.id); })), weightLp());
+            box.addView(fi);
+        }
+        box.addView(smallButton("新增跟进记录", v -> showAddFollowDialog(c.id, "电话", "")));
         box.addView(sectionTitle("快捷操作"));
         LinearLayout ops1 = horizontal(0); box.addView(ops1);
         ops1.addView(primaryButton("导入该企业全部联系人", v -> importCompanyContacts(c.id)), weightLp());
@@ -403,9 +448,9 @@ public class MainActivity extends Activity {
         LinearLayout box = vertical(dp(12));
         box.setPadding(dp(12), dp(12), dp(12), dp(12));
         scroll.addView(box);
-        box.addView(titleRow("导入导出", "宽松导入、宽表导出，客户状态不从Excel导入"));
+        box.addView(titleRow("导入导出", "宽松导入、宽表导出，支持导入时设置客户状态"));
         box.addView(sectionTitle("Excel 导入"));
-        box.addView(infoCard("导入规则", "只要有“公司名称”列即可导入；联系人、电话、备注、标签可动态识别；客户状态默认未设置，需要在App内手动设置。"));
+        box.addView(infoCard("导入规则", "只要有“公司名称”列即可导入；联系人、电话、备注、标签可动态识别；可通过“客户状态”列或本次导入默认状态设置关注/跟进/潜力。高等级状态可覆盖低等级状态。"));
         box.addView(primaryButton("选择 Excel 导入", v -> openImportFile()));
         box.addView(primaryButton("粘贴识别快速录入", v -> showQuickPasteDialog()));
         box.addView(sectionTitle("Excel 导出"));
@@ -422,16 +467,22 @@ public class MainActivity extends Activity {
         scroll.addView(box);
         box.addView(titleRow("我的", "分组、标签、规则与数据维护"));
         box.addView(sectionTitle("当前规则"));
-        box.addView(infoCard("核心规则", "公司名称唯一识别；客户状态默认未设置且只能手动设置；通讯录名称为“公司名称-联系人姓名”；删除通讯录仅删除本App导入的联系人。"));
+        box.addView(infoCard("核心规则", "公司名称唯一识别；客户状态为关注/跟进/潜力，重要程度依次增加；导入时高等级状态可覆盖低等级状态；通讯录名称为“公司名称-联系人姓名”；删除通讯录仅删除本App导入的联系人。"));
         box.addView(sectionTitle("分组管理"));
         for (CustomerDbHelper.GroupItem g : db.getGroups()) {
-            LinearLayout row = horizontal(0); row.setPadding(0, dp(4), 0, dp(4));
-            row.addView(text(g.name, 15, Color.rgb(42, 58, 86), true), new LinearLayout.LayoutParams(0, -2, 1));
-            row.addView(smallButton("详情", v -> showGroupDetail(g)));
-            row.addView(smallButton("导入", v -> showGroupImportDialog(g)));
-            row.addView(smallButton("改名", v -> showRenameGroup(g)));
-            row.addView(smallButton("删除", v -> confirm("删除分组", "删除分组后，企业会移入默认分组。", () -> { db.deleteGroup(g.id); render(); })));
-            box.addView(row);
+            LinearLayout groupCard = card();
+            TextView groupName = text(g.name, 17, Color.rgb(22, 38, 64), true);
+            groupName.setSingleLine(false);
+            groupCard.addView(groupName);
+            CustomerDbHelper.GroupStats gs = db.getGroupStats(g.id);
+            groupCard.addView(text("企业 " + gs.companyCount + "｜联系人 " + gs.contactCount + "｜已导入 " + gs.importedCount + "｜潜力 " + gs.importantCount + "｜3星 " + gs.star3Count, 13, Color.rgb(90,103,125), false));
+            LinearLayout row = horizontal(0);
+            row.addView(smallButton("详情", v -> showGroupDetail(g)), weightLp());
+            row.addView(smallButton("导入", v -> showGroupImportDialog(g)), weightLp());
+            row.addView(smallButton("改名", v -> showRenameGroup(g)), weightLp());
+            row.addView(smallButton("删除", v -> confirm("删除分组", "删除分组后，企业会移入默认分组。", () -> { db.deleteGroup(g.id); render(); })), weightLp());
+            groupCard.addView(row);
+            box.addView(groupCard);
         }
         box.addView(primaryButton("新增分组", v -> showAddGroupDialog()));
         box.addView(sectionTitle("数据维护"));
@@ -441,11 +492,15 @@ public class MainActivity extends Activity {
         LinearLayout m2 = horizontal(0); box.addView(m2);
         m2.addView(primaryButton("压缩数据库", v -> runMaintenance("压缩数据库", () -> db.vacuumDatabase())), weightLp());
         m2.addView(primaryButton("查看导入日志", v -> showImportLogs()), weightLp());
+        box.addView(primaryButton("数据备份与恢复", v -> showBackupDialog()));
         box.addView(primaryButton("查看异常数据", v -> showExceptions()));
+        box.addView(primaryButton("导出异常数据Excel", v -> exportExceptions()));
         box.addView(primaryButton("查看操作日志", v -> showOperationLogs()));
         box.addView(primaryButton("通话记录权限/匹配", v -> showCallLogPage()));
+        box.addView(primaryButton("疑似重复企业检测", v -> showDuplicateSuspects()));
+        box.addView(primaryButton("号码质量清洗", v -> showPhoneCleanPage()));
         box.addView(sectionTitle("使用说明"));
-        box.addView(infoCard("流程", "1. 导入Excel建立企业库\n2. 在客户页搜索、筛选、标记关注/跟进/重点\n3. 按分组或序号区间批量导入通讯录\n4. 在通讯录页查看已导入记录并可同步删除\n5. 定期导出Excel备份"));
+        box.addView(infoCard("流程", "1. 导入Excel建立企业库\n2. 在客户页搜索、筛选、标记关注/跟进/潜力\n3. 按分组或序号区间批量导入通讯录\n4. 在通讯录页查看已导入记录并可同步删除\n5. 定期导出Excel备份"));
         box.addView(primaryButton("清空全部App数据", v -> confirm("危险操作", "清空后无法恢复，且不会删除手机通讯录。确认清空？", () -> { deleteDatabase(CustomerDbHelper.DB_NAME); db = new CustomerDbHelper(this); render(); })));
         content.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
     }
@@ -521,6 +576,8 @@ public class MainActivity extends Activity {
         if (uri == null) return;
         if (requestCode == REQ_IMPORT_XLSX) showImportOptions(uri);
         else if (requestCode == REQ_EXPORT_XLSX) writePendingExport(uri);
+        else if (requestCode == REQ_BACKUP_EXPORT) writeBackupToUri(uri);
+        else if (requestCode == REQ_BACKUP_RESTORE) confirmRestoreFromUri(uri);
     }
 
     private void showImportOptions(Uri uri) {
@@ -533,24 +590,31 @@ public class MainActivity extends Activity {
         CheckBox useExcelGroup = new CheckBox(this);
         useExcelGroup.setText("如果Excel中有“分组”列，优先使用Excel分组");
         useExcelGroup.setChecked(true);
+        Spinner statusSpinner = new Spinner(this);
+        List<String> statusOptions = Arrays.asList("未设置", "关注", "跟进", "潜力");
+        ArrayAdapter<String> statusAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, statusOptions);
+        statusAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        statusSpinner.setAdapter(statusAdapter);
         box.addView(text("选择默认分组", 14, Color.rgb(42, 58, 86), true));
         box.addView(spinner);
         box.addView(useExcelGroup);
-        box.addView(text("说明：客户状态不会从Excel导入，所有新企业默认未设置。", 13, Color.rgb(125, 93, 20), false));
+        box.addView(text("本次导入默认客户状态", 14, Color.rgb(42, 58, 86), true));
+        box.addView(statusSpinner);
+        box.addView(text("说明：Excel中如有“客户状态”列则优先按每行状态导入；否则使用这里选择的默认状态。状态等级为 未设置 < 关注 < 跟进 < 潜力，高等级可覆盖低等级，低等级不会覆盖高等级。旧表中“重点”会按“潜力”处理。", 13, Color.rgb(125, 93, 20), false));
         new AlertDialog.Builder(this)
                 .setTitle("导入Excel")
                 .setView(box)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("开始导入", (d,w)->{
+                .setPositiveButton("解析预览", (d,w)->{
                     CustomerDbHelper.GroupItem g = (CustomerDbHelper.GroupItem) spinner.getSelectedItem();
-                    importExcel(uri, g == null ? db.ensureGroup("默认分组") : g.id, useExcelGroup.isChecked());
+                    previewExcel(uri, g == null ? db.ensureGroup("默认分组") : g.id, useExcelGroup.isChecked(), (String) statusSpinner.getSelectedItem());
                 }).show();
     }
 
-    private void importExcel(Uri uri, long groupId, boolean useExcelGroup) {
+    private void previewExcel(Uri uri, long groupId, boolean useExcelGroup, String defaultStatus) {
         ProgressDialog pd = new ProgressDialog(this);
-        pd.setTitle("正在后台导入 Excel");
-        pd.setMessage("正在解析、查重、批量写入，请勿关闭App……");
+        pd.setTitle("正在解析 Excel");
+        pd.setMessage("正在读取表格并预估导入结果……");
         pd.setIndeterminate(true);
         pd.setCancelable(false);
         pd.show();
@@ -558,12 +622,80 @@ public class MainActivity extends Activity {
             try {
                 List<Map<String, String>> rows = XlsxSimpleReader.readFirstSheet(getContentResolver(), uri);
                 String fileName = uri.getLastPathSegment() == null ? "Excel导入" : uri.getLastPathSegment();
-                CustomerDbHelper.ImportResult r = db.importRows(rows, groupId, useExcelGroup, fileName);
+                CustomerDbHelper.ImportPreviewResult r = db.previewImportRows(rows, groupId, useExcelGroup, fileName, defaultStatus);
+                pendingImportRows = rows;
+                pendingImportUri = uri;
+                pendingImportGroupId = groupId;
+                pendingImportUseExcelGroup = useExcelGroup;
+                pendingImportDefaultStatus = defaultStatus;
+                pendingImportFileName = fileName;
+                runOnUiThread(() -> { pd.dismiss(); showImportPreviewDialog(r); });
+            } catch (Exception e) {
+                runOnUiThread(() -> { pd.dismiss(); new AlertDialog.Builder(this).setTitle("预览失败").setMessage(e.getMessage()).setPositiveButton("确定", null).show(); });
+            }
+        }).start();
+    }
+
+    private void showImportPreviewDialog(CustomerDbHelper.ImportPreviewResult r) {
+        String msg = "本次 Excel 预览结果：
+
+" +
+                "识别企业：" + (r.newCompanies + r.mergedCompanies) + " 家
+" +
+                "新企业：" + r.newCompanies + " 家
+" +
+                "已存在企业：" + r.mergedCompanies + " 家
+" +
+                "预计新增电话：" + r.newPhoneCount + " 个
+" +
+                "预计重复电话：" + r.duplicatePhoneCount + " 个
+" +
+                "预计新增备注：" + r.newNotes + " 条
+" +
+                "客户状态将提升：" + r.statusUpgradeCount + " 家
+" +
+                "客户状态保持不变：" + r.statusKeepCount + " 家
+" +
+                "异常行/提示：" + r.abnormalRows + " 行
+" +
+                "空公司名称行：" + r.skippedNoCompany + " 行
+" +
+                "电话格式异常：" + r.phoneAbnormalCount + " 个
+
+确认后才会正式写入数据库。";
+        new AlertDialog.Builder(this)
+                .setTitle("导入前预览")
+                .setMessage(msg)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("确认导入", (d,w)->importParsedExcel())
+                .show();
+    }
+
+    private void importParsedExcel() {
+        if (pendingImportRows == null) { toast("没有待导入数据"); return; }
+        ProgressDialog pd = new ProgressDialog(this);
+        pd.setTitle("正在后台导入 Excel");
+        pd.setMessage("正在查重、合并、批量写入，请勿关闭App……");
+        pd.setIndeterminate(true);
+        pd.setCancelable(false);
+        pd.show();
+        new Thread(() -> {
+            try {
+                CustomerDbHelper.ImportResult r = db.importRows(pendingImportRows, pendingImportGroupId, pendingImportUseExcelGroup, pendingImportFileName, pendingImportDefaultStatus);
+                pendingImportRows = null;
                 runOnUiThread(() -> {
                     pd.dismiss();
                     new AlertDialog.Builder(this)
                             .setTitle("导入完成")
-                            .setMessage("新增企业：" + r.newCompanies + "\n合并企业：" + r.mergedCompanies + "\n新增联系人：" + r.newContacts + "\n新增备注：" + r.newNotes + "\n新增标签：" + r.newTags + "\n重复行提示：" + r.duplicateRows + "\n跳过无公司名称行：" + r.skippedNoCompany)
+                            .setMessage("新增企业：" + r.newCompanies + "
+合并企业：" + r.mergedCompanies + "
+新增联系人：" + r.newContacts + "
+新增备注：" + r.newNotes + "
+新增标签：" + r.newTags + "
+状态提升：" + r.statusUpgradeCount + "
+状态保持：" + r.statusKeepCount + "
+重复行提示：" + r.duplicateRows + "
+跳过无公司名称行：" + r.skippedNoCompany)
                             .setPositiveButton("确定", (d,w)->{ customerVisibleLimit = PAGE_SIZE; render(); })
                             .show();
                 });
@@ -576,7 +708,7 @@ public class MainActivity extends Activity {
     private void showExportDialog() {
         LinearLayout box = vertical(dp(8)); box.setPadding(dp(18), dp(8), dp(18), dp(8));
         List<String> options = new ArrayList<>();
-        options.add("全部企业"); options.add("未设置状态"); options.add("关注客户"); options.add("跟进客户"); options.add("重点客户");
+        options.add("全部企业"); options.add("未设置状态"); options.add("关注客户"); options.add("跟进客户"); options.add("潜力客户");
         for (CustomerDbHelper.GroupItem g : db.getGroups()) options.add("分组：" + g.name);
         Spinner sp = new Spinner(this);
         ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, options);
@@ -587,7 +719,7 @@ public class MainActivity extends Activity {
             if ("未设置状态".equals(opt)) { prepareExportByFilter(opt, CustomerDbHelper.STATUS_NONE, 0); }
             else if ("关注客户".equals(opt)) { prepareExportByFilter(opt, CustomerDbHelper.STATUS_FOCUS, 0); }
             else if ("跟进客户".equals(opt)) { prepareExportByFilter(opt, CustomerDbHelper.STATUS_FOLLOW, 0); }
-            else if ("重点客户".equals(opt)) { prepareExportByFilter(opt, CustomerDbHelper.STATUS_IMPORTANT, 0); }
+            else if ("潜力客户".equals(opt)) { prepareExportByFilter(opt, CustomerDbHelper.STATUS_IMPORTANT, 0); }
             else if (opt != null && opt.startsWith("分组：")) {
                 String name = opt.substring(3);
                 long gid = 0; for (CustomerDbHelper.GroupItem g : db.getGroups()) if (g.name.equals(name)) gid = g.id;
@@ -639,7 +771,7 @@ public class MainActivity extends Activity {
     }
 
     private void exportTemplate() {
-        pendingExportHeaders = Arrays.asList("序号", "分组", "公司名称", "所属行业", "参保人数", "区域", "地址", "联系人1", "电话号码1", "星级1", "联系人2", "电话号码2", "星级2", "备注1", "备注2", "标签1", "标签2");
+        pendingExportHeaders = Arrays.asList("序号", "分组", "客户状态", "公司名称", "所属行业", "参保人数", "区域", "地址", "联系人1", "电话号码1", "星级1", "联系人2", "电话号码2", "星级2", "联系人3", "电话号码3", "星级3", "联系人4", "电话号码4", "星级4", "备注1", "备注2", "备注3", "备注4", "备注5", "标签1", "标签2", "标签3", "标签4", "标签5");
         pendingExportRows = new ArrayList<>();
         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
@@ -1018,6 +1150,55 @@ public class MainActivity extends Activity {
         }).show();
     }
 
+    private void showAddFollowDialog(long companyId, String defaultMethod, String defaultContent) {
+        LinearLayout box = vertical(dp(8)); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        Spinner method = new Spinner(this);
+        List<String> methods = Arrays.asList("电话", "微信", "面访", "短信", "其他");
+        ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, methods);
+        ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item); method.setAdapter(ad);
+        int idx = methods.indexOf(defaultMethod); if (idx >= 0) method.setSelection(idx);
+        EditText content = edit("跟进内容", defaultContent); content.setMinLines(4);
+        EditText next = edit("下次跟进日期，例如 2026-06-30，可为空", "");
+        box.addView(text("跟进方式", 13, Color.rgb(42,58,86), true)); box.addView(method); box.addView(content); box.addView(next);
+        new AlertDialog.Builder(this).setTitle("新增跟进记录").setView(box).setNegativeButton("取消", null).setPositiveButton("保存", (d,w)->{
+            db.addFollowRecord(companyId, (String) method.getSelectedItem(), content.getText().toString(), next.getText().toString());
+            toast("已保存跟进记录"); showCompanyDetail(companyId);
+        }).show();
+    }
+
+    private void showCallToFollowDialog(CustomerDbHelper.CallRecordItem cr) {
+        String content = cr.callTimeText + " " + cr.callType + "电话，通话" + cr.duration + "秒。";
+        showAddFollowDialog(cr.appCompanyId, "电话", content);
+    }
+
+    private void showFollowTaskPage(String mode) {
+        String title = "today".equals(mode) ? "今日待跟进" : ("overdue".equals(mode) ? "逾期未跟进" : "即将跟进");
+        ScrollView scroll = scroll(); LinearLayout box = vertical(dp(8)); box.setPadding(dp(12), dp(8), dp(12), dp(8)); scroll.addView(box);
+        box.addView(titleRow(title, "根据企业跟进记录中的下次跟进日期生成"));
+        List<CustomerDbHelper.FollowTaskItem> tasks = db.getFollowTasks(mode, 150);
+        if (tasks.isEmpty()) box.addView(emptyBox("暂无" + title, "可在企业详情页新增跟进记录并设置下次跟进日期"));
+        for (CustomerDbHelper.FollowTaskItem t : tasks) {
+            LinearLayout card = card();
+            card.addView(text(t.companyName + "｜" + (CustomerDbHelper.empty(t.customerStatus)?"未设置":t.customerStatus), 16, Color.rgb(22,38,64), true));
+            card.addView(text("下次跟进：" + nvl(t.nextFollowDate,"未设置") + "｜方式：" + nvl(t.followMethod,"其他"), 13, Color.rgb(90,103,125), false));
+            card.addView(text(nvl(t.content,""), 13, Color.rgb(90,103,125), false));
+            LinearLayout ops = horizontal(0); card.addView(ops);
+            ops.addView(smallButton("查看企业", v -> showCompanyDetail(t.companyId)), weightLp());
+            ops.addView(smallButton("完成", v -> { db.markFollowDone(t.followId, true); showFollowTaskPage(mode); }), weightLp());
+            box.addView(card);
+        }
+        new AlertDialog.Builder(this).setView(scroll).setPositiveButton("关闭", null).show();
+    }
+
+    private void showPotentialCustomerPage() {
+        ScrollView scroll = scroll(); LinearLayout box = vertical(dp(8)); box.setPadding(dp(12), dp(8), dp(12), dp(8)); scroll.addView(box);
+        box.addView(titleRow("潜力客户", "按潜力状态、3星号码、下次跟进、更新时间优先显示"));
+        List<CustomerDbHelper.CompanyItem> list = db.getPotentialCompanies(150);
+        if (list.isEmpty()) box.addView(emptyBox("暂无潜力客户", "可通过导入客户状态或详情页手动设置为潜力"));
+        for (CustomerDbHelper.CompanyItem c : list) box.addView(companyCard(c));
+        new AlertDialog.Builder(this).setView(scroll).setPositiveButton("关闭", null).show();
+    }
+
     private void showCallLogPage() {
         ScrollView scroll = scroll();
         LinearLayout box = vertical(dp(8)); box.setPadding(dp(12), dp(8), dp(12), dp(8)); scroll.addView(box);
@@ -1039,7 +1220,10 @@ public class MainActivity extends Activity {
         card.addView(text(nameInfo + "｜时长：" + cr.duration + "秒｜状态：" + cr.status, 13, Color.rgb(90,103,125), false));
         if (cr.appCompanyId > 0) card.addView(text("App匹配：" + cr.appCompanyName + " " + nvl(cr.appContactName, "") + "｜备注：" + nvl(cr.appNote, "无"), 13, Color.rgb(90,103,125), false));
         LinearLayout ops = horizontal(0); card.addView(ops);
-        if (cr.appCompanyId > 0) ops.addView(smallButton("查看企业", v -> showCompanyDetail(cr.appCompanyId)), weightLp());
+        if (cr.appCompanyId > 0) {
+            ops.addView(smallButton("查看企业", v -> showCompanyDetail(cr.appCompanyId)), weightLp());
+            ops.addView(smallButton("生成跟进", v -> showCallToFollowDialog(cr)), weightLp());
+        }
         ops.addView(smallButton("加入已有企业", v -> showAttachCallToCompany(cr)), weightLp());
         ops.addView(smallButton("新建企业", v -> showNewCompanyFromCall(cr)), weightLp());
         ops.addView(smallButton("忽略", v -> { db.updateCallRecordStatus(cr.id, "已忽略"); showCallLogPage(); }), weightLp());
@@ -1150,6 +1334,128 @@ public class MainActivity extends Activity {
         ArrayList<CustomerDbHelper.ContactItem> contacts = new ArrayList<>();
         for (CustomerDbHelper.CompanyItem c : companies) contacts.addAll(db.getContacts(c.id, false));
         importContactsWithPreview(contacts);
+    }
+
+    private void autoBackupBeforeV13Open() {
+        try {
+            SharedPreferences sp = getSharedPreferences("upgrade", MODE_PRIVATE);
+            if (sp.getBoolean("v13_auto_backup_done", false)) return;
+            File dbFile = getDatabasePath(CustomerDbHelper.DB_NAME);
+            if (dbFile.exists()) {
+                File dir = new File(getExternalFilesDir(null), "backups");
+                if (!dir.exists()) dir.mkdirs();
+                File out = new File(dir, "企业客户管家_V13升级前自动备份_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.CHINA).format(new Date()) + ".db");
+                copyFile(dbFile, out);
+            }
+            sp.edit().putBoolean("v13_auto_backup_done", true).apply();
+        } catch (Exception ignored) {}
+    }
+
+    private void showBackupDialog() {
+        LinearLayout box = vertical(dp(8)); box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        box.addView(infoCard("说明", "备份会保存完整数据库。恢复会覆盖当前App内数据，恢复前系统会先自动备份当前数据。"));
+        box.addView(primaryButton("一键备份到App备份目录", v -> runMaintenance("一键备份", () -> createInternalBackup())));
+        box.addView(primaryButton("导出完整备份文件", v -> exportBackupFile())) ;
+        box.addView(primaryButton("从备份文件恢复", v -> openRestoreBackupFile()));
+        new AlertDialog.Builder(this).setTitle("数据备份与恢复").setView(box).setPositiveButton("关闭", null).show();
+    }
+
+    private void createInternalBackup() {
+        try {
+            File dbFile = getDatabasePath(CustomerDbHelper.DB_NAME);
+            File dir = new File(getExternalFilesDir(null), "backups");
+            if (!dir.exists()) dir.mkdirs();
+            File out = new File(dir, "企业客户管家备份_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.CHINA).format(new Date()) + ".db");
+            copyFile(dbFile, out);
+            db.logOperation("数据备份", "一键备份", out.getAbsolutePath());
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private void exportBackupFile() {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("application/octet-stream");
+        i.putExtra(Intent.EXTRA_TITLE, "企业客户管家备份_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.CHINA).format(new Date()) + ".db");
+        startActivityForResult(i, REQ_BACKUP_EXPORT);
+    }
+
+    private void writeBackupToUri(Uri uri) {
+        ProgressDialog pd = new ProgressDialog(this); pd.setTitle("正在导出备份"); pd.setMessage("正在复制数据库文件……"); pd.setIndeterminate(true); pd.setCancelable(false); pd.show();
+        new Thread(() -> { try { copyFileToUri(getDatabasePath(CustomerDbHelper.DB_NAME), uri); db.logOperation("数据备份", "导出备份文件", String.valueOf(uri)); runOnUiThread(() -> { pd.dismiss(); toast("备份导出成功"); }); } catch(Exception e) { runOnUiThread(() -> { pd.dismiss(); new AlertDialog.Builder(this).setTitle("备份失败").setMessage(e.getMessage()).setPositiveButton("确定", null).show(); }); } }).start();
+    }
+
+    private void openRestoreBackupFile() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, REQ_BACKUP_RESTORE);
+    }
+
+    private void confirmRestoreFromUri(Uri uri) {
+        confirm("恢复备份", "恢复备份会覆盖当前App内数据。系统将先自动备份当前数据，再执行恢复。是否继续？", () -> restoreBackupFromUri(uri));
+    }
+
+    private void restoreBackupFromUri(Uri uri) {
+        ProgressDialog pd = new ProgressDialog(this); pd.setTitle("正在恢复备份"); pd.setMessage("请勿关闭App……"); pd.setIndeterminate(true); pd.setCancelable(false); pd.show();
+        new Thread(() -> {
+            try {
+                createInternalBackup();
+                db.close();
+                File dbFile = getDatabasePath(CustomerDbHelper.DB_NAME);
+                copyUriToFile(uri, dbFile);
+                db = new CustomerDbHelper(this);
+                db.logOperation("数据恢复", "从备份文件恢复", String.valueOf(uri));
+                runOnUiThread(() -> { pd.dismiss(); new AlertDialog.Builder(this).setTitle("恢复完成").setMessage("备份已恢复。建议重新打开App确认数据。 ").setPositiveButton("确定", (d,w)->render()).show(); });
+            } catch(Exception e) { runOnUiThread(() -> { pd.dismiss(); new AlertDialog.Builder(this).setTitle("恢复失败").setMessage(e.getMessage()).setPositiveButton("确定", null).show(); }); }
+        }).start();
+    }
+
+    private void copyFile(File src, File dst) throws Exception { try (InputStream in = new FileInputStream(src); OutputStream out = new FileOutputStream(dst)) { byte[] buf = new byte[8192]; int n; while ((n=in.read(buf))>0) out.write(buf,0,n); } }
+    private void copyFileToUri(File src, Uri uri) throws Exception { try (InputStream in = new FileInputStream(src); OutputStream out = getContentResolver().openOutputStream(uri)) { byte[] buf = new byte[8192]; int n; while ((n=in.read(buf))>0) out.write(buf,0,n); } }
+    private void copyUriToFile(Uri uri, File dst) throws Exception { try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(dst)) { byte[] buf = new byte[8192]; int n; while ((n=in.read(buf))>0) out.write(buf,0,n); } }
+
+    private void exportExceptions() {
+        List<CustomerDbHelper.ExceptionItem> list = db.getExceptions(5000);
+        pendingExportHeaders = Arrays.asList("时间", "来源", "行号", "公司名称", "异常原因", "原始数据");
+        pendingExportRows = new ArrayList<>();
+        for (CustomerDbHelper.ExceptionItem it : list) pendingExportRows.add(Arrays.asList(nvl(it.createdAt,""), nvl(it.source,""), String.valueOf(it.rowNo), nvl(it.companyName,""), nvl(it.reason,""), nvl(it.rawText,"")));
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"); i.putExtra(Intent.EXTRA_TITLE, "企业客户管家_异常数据_" + new SimpleDateFormat("yyyyMMdd_HHmm", Locale.CHINA).format(new Date()) + ".xlsx"); startActivityForResult(i, REQ_EXPORT_XLSX);
+    }
+
+    private void showDuplicateSuspects() {
+        ScrollView scroll = scroll(); LinearLayout box = vertical(dp(8)); box.setPadding(dp(12), dp(8), dp(12), dp(8)); scroll.addView(box);
+        box.addView(titleRow("疑似重复企业", "只提示，不自动合并；合并必须手动确认"));
+        List<CustomerDbHelper.DuplicateItem> list = db.findDuplicateSuspects(80);
+        if (list.isEmpty()) box.addView(emptyBox("暂无疑似重复企业", "系统未发现明显重复"));
+        for (CustomerDbHelper.DuplicateItem it : list) {
+            LinearLayout card = card(); card.addView(text(it.reason, 14, Color.rgb(170,94,20), true));
+            card.addView(text("A：" + it.companyAName, 15, Color.rgb(42,58,86), true)); card.addView(text("B：" + it.companyBName, 15, Color.rgb(42,58,86), true));
+            LinearLayout ops = horizontal(0); card.addView(ops);
+            ops.addView(smallButton("看A", v -> showCompanyDetail(it.companyAId)), weightLp());
+            ops.addView(smallButton("看B", v -> showCompanyDetail(it.companyBId)), weightLp());
+            ops.addView(smallButton("合并到A", v -> confirm("合并企业", "将把B的联系人、备注、跟进记录合并到A，并删除B。是否继续？", () -> { db.mergeCompanies(it.companyAId, it.companyBId); showDuplicateSuspects(); })), weightLp());
+            ops.addView(smallButton("忽略", v -> { db.ignoreDuplicate(it.key); showDuplicateSuspects(); }), weightLp());
+            box.addView(card);
+        }
+        new AlertDialog.Builder(this).setView(scroll).setPositiveButton("关闭", null).show();
+    }
+
+    private void showPhoneCleanPage() {
+        List<CustomerDbHelper.PhoneIssueItem> issues = db.scanPhoneIssues(200);
+        StringBuilder sb = new StringBuilder();
+        int preview = Math.min(60, issues.size());
+        for (int i=0;i<preview;i++) {
+            CustomerDbHelper.PhoneIssueItem it = issues.get(i);
+            sb.append(i+1).append(". ").append(it.reason).append("\n").append(nvl(it.companyName,"")).append(" ").append(nvl(it.contactName,"")).append(" ").append(nvl(it.phone,it.phoneNorm)).append(" → ").append(nvl(it.suggested,"")).append("\n\n");
+        }
+        if (issues.size() > preview) sb.append("……共发现 ").append(issues.size()).append(" 条提示");
+        if (issues.isEmpty()) sb.append("暂无明显号码问题");
+        new AlertDialog.Builder(this)
+                .setTitle("号码质量清洗")
+                .setMessage(sb.toString())
+                .setNegativeButton("关闭", null)
+                .setPositiveButton("确认清洗格式", (d,w)->confirm("确认清洗", "仅清洗空格、横线、+86等格式问题，不自动合并企业。是否继续？", () -> { int n=db.cleanPhoneFormats(); toast("已清洗 " + n + " 个号码"); render(); }))
+                .show();
     }
 
     private void showGroupDetail(CustomerDbHelper.GroupItem g) {
